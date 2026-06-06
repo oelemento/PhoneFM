@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>PhoneFM</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+
+    <!-- HealthKit permission strings -->
+    <key>NSHealthShareUsageDescription</key>
+    <string>PhoneFM reads your heart rate, HRV, sleep, activity, ECG, and connected health-record data to compute a personalized cardiovascular risk trend. All inference runs on your device; no data leaves your iPhone.</string>
+    <key>NSHealthUpdateUsageDescription</key>
+    <string>PhoneFM does not write to your Health data.</string>
+    <key>NSHealthClinicalHealthRecordsShareUsageDescription</key>
+    <string>PhoneFM reads diagnoses, medications, lab results, and procedures from your connected health records (Apple Health Records via your hospital) to contextualize your cardio risk trend. All processing is on-device.</string>
+
+    <!-- Background updates -->
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>processing</string>
+    </array>
+    <key>BGTaskSchedulerPermittedIdentifiers</key>
+    <array>
+        <string>com.phonefm.app.refresh</string>
+    </array>
+
+    <!-- HealthKit + Apple Foundation Models capabilities declared via entitlement -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+    </dict>
+</dict>
+</plist>
