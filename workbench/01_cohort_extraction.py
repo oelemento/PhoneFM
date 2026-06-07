@@ -159,6 +159,20 @@ with open("/tmp/splits.json", "w") as f:
 
 
 # ============================================================
+# CELL 5b — sync cohort artifacts to workspace bucket
+# ============================================================
+# /tmp is wiped on Workbench env autosuspend/restart. Push cohort artifacts
+# to the workspace bucket so 02_tokenizer.py can re-fetch them after a
+# restart without re-running the cohort BigQuery.
+from google.cloud import storage  # noqa: E402
+gcs = storage.Client()
+bkt = gcs.bucket(BUCKET.replace("gs://", ""))
+for fname in ["cohort_base.parquet", "splits.json", "endpoint_concept_ids.json"]:
+    bkt.blob(f"phonefm/cohort/{fname}").upload_from_filename(f"/tmp/{fname}")
+print(f"Cohort artifacts synced to {BUCKET}/phonefm/cohort/")
+
+
+# ============================================================
 # CELL 6 — sketch the time-series feature extraction window
 # ============================================================
 # Per participant: produce 30-day windows ending at random calendar days

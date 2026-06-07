@@ -36,7 +36,9 @@ WINDOW_DAYS    = 30
 LOOKAHEAD_DAYS = 30
 HR_BIN_MIN     = 5
 MAX_LEN        = 4096
-CHUNK_SIZE     = 1500   # participants per bulk-fetch batch (tune for RAM)
+CHUNK_SIZE     = 500    # participants per bulk-fetch batch — keep ≤500 on
+                        # 13 GB n1-highmem-2; bulk HR query for 1500 pids
+                        # OOMed the JupyterLab server in the previous run.
 
 
 # ============================================================
