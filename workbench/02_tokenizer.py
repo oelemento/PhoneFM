@@ -106,15 +106,13 @@ FROM `{CDR}.steps_intraday`
 WHERE person_id IN UNNEST(@ids)
 GROUP BY person_id, DATE(datetime)
 """
-HRV_SQL = f"""
-SELECT value
-FROM `{CDR}.heart_rate_summary`
-WHERE person_id IN UNNEST(@ids) AND metric = 'hrv_rmssd'
-"""
-
+# Note: AoU CDR v8 heart_rate_summary is HR-zones (min/max HR per zone), not
+# HRV. There is no HRV column. Drop HRV tokens for now — model still gets HR
+# + steps + EHR. Future work: compute HRV proxy (rolling std of minute HR)
+# from heart_rate_minute_level.
 hr_ref    = build_decile_reference("hr",    HR_SQL)
 steps_ref = build_decile_reference("steps", STEPS_SQL)
-hrv_ref   = build_decile_reference("hrv",   HRV_SQL)
+hrv_ref   = np.array([])  # disabled — see note above
 
 
 # ============================================================
@@ -245,18 +243,8 @@ def fetch_steps_chunk(participant_ids):
 
 
 def fetch_hrv_chunk(participant_ids):
-    sql = f"""
-    SELECT person_id, DATE(date) AS d, AVG(value) AS v
-    FROM `{CDR}.heart_rate_summary`
-    WHERE person_id IN UNNEST(@ids) AND metric = 'hrv_rmssd'
-    GROUP BY person_id, d
-    """
-    df = bq.query(sql, job_config=_q_ids(participant_ids)).to_dataframe()
-    if not len(df):
-        return df
-    df["dec"] = ecdf_decile(df["v"].to_numpy(), hrv_ref)
-    df["ts"] = pd.to_datetime(df["d"].astype(str)) + pd.Timedelta(hours=23)
-    return df[["person_id", "ts", "dec"]]
+    # HRV disabled — no source column in AoU CDR v8 heart_rate_summary.
+    return pd.DataFrame(columns=["person_id", "ts", "dec"])
 
 
 def fetch_ehr_chunk(participant_ids):
