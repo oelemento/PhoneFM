@@ -127,7 +127,7 @@ def build_ehr_vocab():
     dx = bq.query(f"""
       SELECT co.person_id, c.concept_code
       FROM `{CDR}.condition_occurrence` co
-      JOIN `{CDR}.concept` c ON co.condition_concept_id = c.concept_id
+      JOIN `{CDR}.concept` c ON co.condition_source_concept_id = c.concept_id
       WHERE co.person_id IN ({ids_csv}) AND c.vocabulary_id = 'ICD10CM'
     """).to_dataframe()
     for code in dx["concept_code"].dropna():
@@ -237,7 +237,7 @@ def encode_window(person_id: int, end_date: date) -> dict:
     SELECT * FROM (
       SELECT co.condition_start_date AS ts, CONCAT('DX10:', SUBSTR(c.concept_code, 1, 3)) AS tok
       FROM `{CDR}.condition_occurrence` co
-      JOIN `{CDR}.concept` c ON co.condition_concept_id = c.concept_id
+      JOIN `{CDR}.concept` c ON co.condition_source_concept_id = c.concept_id
       WHERE co.person_id = {person_id}
         AND co.condition_start_date BETWEEN '{start_date}' AND '{end_date}'
         AND c.vocabulary_id = 'ICD10CM'
@@ -296,7 +296,7 @@ def encode_window(person_id: int, end_date: date) -> dict:
     WHERE person_id = {person_id}
       AND condition_start_date BETWEEN DATE_ADD('{end_date}', INTERVAL 1 DAY)
                                   AND DATE_ADD('{end_date}', INTERVAL {LOOKAHEAD_DAYS} DAY)
-      AND condition_concept_id IN UNNEST(@cardio_ids)
+      AND condition_source_concept_id IN UNNEST(@cardio_ids)
     LIMIT 1
     """
     job = bq.query(label_sql, job_config=bigquery.QueryJobConfig(

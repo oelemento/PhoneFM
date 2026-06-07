@@ -113,7 +113,7 @@ SELECT
   END AS encounter_type
 FROM `{CDR}.condition_occurrence` co
 LEFT JOIN `{CDR}.visit_occurrence` vo USING (visit_occurrence_id)
-WHERE co.condition_concept_id IN ({ids_csv})
+WHERE co.condition_source_concept_id IN ({ids_csv})
   AND co.person_id IN UNNEST({cohort['person_id'].tolist()})
 """
 events = bq.query(EVENTS_SQL).to_dataframe()
