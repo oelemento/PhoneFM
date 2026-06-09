@@ -224,14 +224,18 @@ def report_label_distribution(shards_glob: str) -> dict[str, dict[str, float]]:
     frames = [pd.read_parquet(p) for p in sorted(glob.glob(shards_glob))]
     n = sum(len(f) for f in frames)
     out = {}
+    # Cap pos_weight at 200 to prevent BCE gradient explosion when n_pos is tiny
+    # (observed cv_death n_pos=3 → raw pos_weight=212,797 → NaN at step 50).
+    # 200 corresponds to a class prior of ~0.5%; below that the head is too weak
+    # to learn anyway and should be dropped via HEAD_WEIGHTS.
+    MAX_POS_WEIGHT = 200.0
     for ep in ENDPOINTS:
         col = np.concatenate([f[f"label_{ep}"].values for f in frames])
         n_pos = int(col.sum())
         if n_pos == 0:
-            # No positives in this split: keep weight benign and flag.
             pos_weight = 1.0
         else:
-            pos_weight = (n - n_pos) / n_pos
+            pos_weight = min((n - n_pos) / n_pos, MAX_POS_WEIGHT)
         out[ep] = {
             "n": n, "n_pos": n_pos, "pos_rate": n_pos / max(n, 1),
             "pos_weight_for_bce": float(pos_weight),

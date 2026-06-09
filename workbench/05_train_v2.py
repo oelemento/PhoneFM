@@ -91,14 +91,20 @@ for ep, s in train_stats.items():
           f"  pos_rate={s['pos_rate']:.4f}  pos_weight={s['pos_weight_for_bce']:.2f}")
 
 POS_WEIGHTS = {ep: train_stats[ep]["pos_weight_for_bce"] for ep in ENDPOINTS}
-# Drop any endpoint with zero training positives from the loss (head_weight=0).
-# Training such a head would push it toward all-negative, wasting capacity without
-# learning anything useful. The head still computes a logit at eval time but does
-# not contribute to gradients.
-HEAD_WEIGHTS = {ep: (1.0 if train_stats[ep]["n_pos"] > 0 else 0.0) for ep in ENDPOINTS}
+# Drop endpoints with fewer than MIN_POS positives from the loss (head_weight=0).
+# Below this threshold the head can't learn meaningfully and the very-high
+# pos_weight risks numerical instability (cv_death with n_pos=3 produced NaN
+# loss at step 50 in the first attempt). The head still computes logits at
+# eval time but does not contribute to gradients.
+MIN_POS_FOR_TRAINING = 50
+HEAD_WEIGHTS = {
+    ep: (1.0 if train_stats[ep]["n_pos"] >= MIN_POS_FOR_TRAINING else 0.0)
+    for ep in ENDPOINTS
+}
 _dropped = [ep for ep, w in HEAD_WEIGHTS.items() if w == 0.0]
 if _dropped:
-    print(f"WARNING: dropping heads {_dropped} from loss (zero positives in train)", flush=True)
+    print(f"WARNING: dropping heads {_dropped} from loss "
+          f"(<{MIN_POS_FOR_TRAINING} positives in train)", flush=True)
 
 
 # ============================================================
