@@ -6,6 +6,7 @@
 **Builds on:** v2 (commit `c62a31b` on `v2-dev`), val AFib AUROC 0.9229 after epoch 0
 
 **Changelog:**
+- v0.5 (2026-06-09): finalize §13 decisions — empirical cohort check confirms 76% retention at 545d filter → keep 365d max horizon; per-endpoint masking adopted; v2 test eval mandated before v3 training; subgroup definitions JSON pre-registered.
 - v0.4 (2026-06-09): incorporate v2 training lessons — drop epochs 10→5 with early stopping (v2 peaked at epoch 2), inherit numerical stability defaults that took v2 5 mid-training restarts to discover, add pre-launch sanity assertions, bootstrap CI eval, sum-of-primary-AUROCs as best metric, larger-backbone ablation. See §14.
 - v0.3 (2026-06-09): adopt four enhancements per strategy review — self-supervised pre-training (stub committed at `workbench/04_pretrain_v3.py`), negative-control endpoints, discrete-time hazard framing, pre-registered subgroup analyses. PRS integration and iPhone deployment moved to future-work section.
 - v0.2 (2026-06-09): drop OSA as a primary outcome (AoU prevalence 2.5% vs. true ~25% → detection bias dominates); move OSA to baseline confounder. Document empirical OSA prevalence query results. Address Critical feasibility-reviewer findings on cohort size empirical check, SNOMED descendant traversal, and multi-source phenotyping.
@@ -334,14 +335,102 @@ Both are post-v3 paper-prep work.
 
 ---
 
-## 13. Decision points before commit
+## 13. Decision points — ALL RESOLVED (2026-06-09)
 
-- [ ] Pick the final endpoint list (this draft proposes 4 primary domains + 3 negative controls = 13 heads)
-- [ ] Confirm max horizon (365d or 180d) — empirical cohort-size check still pending
-- [ ] Confirm baseline-exclusion strategy (per-endpoint mask vs. cohort drop)
-- [x] Pick best_metric formula for `best.pt` selection → §14.10: sum of primary-endpoint AUROCs
-- [ ] Decide whether to run v3 immediately or first validate v2 on test set
-- [ ] Confirm subgroup definitions JSON before any test-set evaluation
+- [x] **Endpoint list = 4 primary domains + 3 negative controls = 13 heads** (§2 + §11.2). Final list:
+  - mortality_30d, mortality_180d, mortality_365d
+  - t2d_180d, t2d_365d (first-recorded, multi-source phenotype)
+  - dep_180d, dep_365d (first-recorded, multi-source phenotype)
+  - cv_composite_30d, cv_composite_180d, cv_composite_365d (AFib + MI + HF descendants via concept_ancestor)
+  - skin_neoplasm_365d, refractive_errors_365d, dental_caries_365d (negative controls)
+
+- [x] **Max horizon = 365d** (§13.1 empirical evidence below)
+
+- [x] **Baseline-exclusion strategy = per-endpoint mask** (§4 already specifies this). A participant with baseline T2D contributes mask=0 to T2D heads but mask=1 to all other heads, preserving training signal across non-affected endpoints. Cohort-level drop was rejected because it would lose ~30% of windows to a single endpoint's exclusion.
+
+- [x] **best_metric = sum of primary endpoint AUROCs** (§14.10)
+
+- [x] **Pre-v3: validate v2 on test set FIRST** (§13.2 below)
+
+- [x] **Subgroup definitions JSON pre-registered now** (§13.3 below — `data_prep/subgroup_definitions.json` to be committed before any test access)
+
+### 13.1 Empirical cohort-size results (driving the 365d max horizon decision)
+
+Query against `wb-silky-artichoke-2408.C2024Q3R8.heart_rate_minute_level`, GROUP BY person_id, filtered to PhoneFM cohort (12,453 pids):
+
+| Observation-span filter | Cohort retained | Retention | Notes |
+|---|---|---|---|
+| ≥ 210d (v2 baseline) | 12,100 | 100% | Current v2 cohort |
+| ≥ 360d | 10,381 | 86% | If max horizon = 180d |
+| ≥ 450d | 9,759 | 81% | If max horizon = 270d |
+| **≥ 545d** (v3 baseline) | **9,242** | **76%** | **Adopted: 180d input + 365d max horizon** |
+| ≥ 730d | 7,966 | 66% | Rejected: 24% loss too aggressive |
+
+Distribution stats: median span 1,009 days (~2.8 years), p25 = 529d, p75 = 1,821d. Median actual days-with-data within span = 690 (~68% data density). The PhoneFM cohort is unusually long-lived because we already require ≥180d as a v2 cohort filter.
+
+**Resolution:** 365d max horizon retains 9,242 participants. After 80/10/10 split: ~7,400 train / ~920 val / ~920 test. Sufficient for multi-task training across 10 active heads + 3 negative controls.
+
+### 13.2 Run order: validate v2 on test, THEN start v3
+
+Rationale:
+- v2 test eval is ~30 min vs. v3 full pipeline ~5-6h. Cheap to do first.
+- v2's val AFib AUROC 0.9285 is the headline claim of any current paper. If it doesn't hold on test, we have a generalization problem v3 won't fix and the work should pause for diagnosis.
+- v2 test numbers are the BASELINE that v3 must beat. Paper requires both.
+- The v2 best.pt checkpoint is locked at epoch 2 (afib_auroc=0.9285, saved 2026-06-09 18:19). Stable for downstream eval.
+
+**Sequence:**
+1. v2 training finishes (~30 min from this writing)
+2. Run `06_eval_v2_test.py` on the v2 test shards using the saved `best.pt`. Report per-endpoint AUROC + bootstrap 95% CI (per §14.8). Expected runtime <30 min on A100.
+3. If v2 test AFib AUROC ≥ 0.85 (some generalization gap is normal): proceed to v3. If below 0.85: pause, investigate generalization gap before any v3 work.
+4. Pretrain backbone via `04_pretrain_v3.py` (~1.5h)
+5. Re-tokenize for v3 endpoints + new cohort filter (~3h on n1-highmem-2)
+6. Train v3 supervised (~3h, 5 epochs)
+7. Eval v3 on test with subgroup + DCA + Cox sensitivity analyses
+
+Total time to v3 results: ~3 days work + ~12h compute, $15-25.
+
+### 13.3 Pre-registered subgroup definitions
+
+To be saved as `data_prep/subgroup_definitions.json` BEFORE any test-set evaluation script is written. SHA1 of this file is checked in the eval script; if it has changed after first commit, the eval is considered invalid.
+
+```json
+{
+  "race": {
+    "Black or African American": [8516],
+    "Hispanic or Latino": [38003563, 38003564],
+    "Asian": [8515],
+    "White": [8527],
+    "Other": [8557, 8657, 0]
+  },
+  "age_at_end_date": {
+    "<55": [0, 54],
+    "55-65": [55, 65],
+    ">65": [66, 120]
+  },
+  "sex_at_birth": {
+    "Female": [45878463],
+    "Male": [45880669]
+  },
+  "ses_income_quartile": {
+    "Q1 (lowest)": [1, 1],
+    "Q2": [2, 2],
+    "Q3": [3, 3],
+    "Q4 (highest)": [4, 4]
+  },
+  "interactions": [
+    "race × age_at_end_date"
+  ],
+  "metrics_per_subgroup": [
+    "AUROC", "AUPRC", "Brier", "calibration_intercept", "calibration_slope"
+  ],
+  "bootstrap_n": 1000,
+  "ci_level": 0.95
+}
+```
+
+Race concept IDs are AoU's standard `race_concept_id` values. Age is computed as `(end_date - person.birth_datetime).years` at window encoding time. Sex from `person.sex_at_birth_concept_id`. SES from AoU's `income_concept_id` mapped to quartiles per AoU PPI documentation.
+
+Per-subgroup reporting threshold: any cell with N < 30 is reported as "N/A (insufficient sample)" rather than producing low-confidence AUROC point estimates.
 
 ---
 
