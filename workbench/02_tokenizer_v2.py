@@ -99,8 +99,14 @@ CHUNK_SIZE = 200   # participants per BQ chunk; same as v1 (constrained by to_da
 # CELL 2 — load cohort + splits + vocab
 # ============================================================
 cohort = pd.read_parquet(DATA_DIR / "cohort_base.parquet")
-cohort["fitbit_start"] = pd.to_datetime(cohort["fitbit_start"])
-cohort["fitbit_end"] = pd.to_datetime(cohort["fitbit_end"])
+# CRITICAL: normalize cohort timestamps to midnight. AoU stores fitbit_start/end
+# as full DATETIME values (e.g. '2021-02-17 07:23:15'). All wearable/EHR keys
+# derived from BQ are at midnight via .dt.normalize(). If we don't strip the
+# time component here, `day in steps_by_d` returns False for EVERY day in EVERY
+# window, producing all-zero wearable_feats arrays and downstream NaN at training
+# time. This bug cost ~2h of compute on the first tokenization pass.
+cohort["fitbit_start"] = pd.to_datetime(cohort["fitbit_start"]).dt.normalize()
+cohort["fitbit_end"] = pd.to_datetime(cohort["fitbit_end"]).dt.normalize()
 # Require >= 180 + 30 = 210 days of observation
 cohort["observation_days"] = (cohort["fitbit_end"] - cohort["fitbit_start"]).dt.days
 cohort = cohort[cohort["observation_days"] >= N_DAYS_INPUT + N_DAYS_HORIZON].reset_index(drop=True)
