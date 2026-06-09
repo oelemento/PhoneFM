@@ -150,9 +150,15 @@ def main() -> None:
     print("\npre-scanning test shards for person_ids...", flush=True)
     test_glob = str(DATA_DIR / "test_*.parquet")
     person_ids_per_row: list = []
+    # Per-shard boundary tracking for the cross-check below
+    shard_first_pids: list = []
+    shard_row_counts: list = []
     for path in sorted(glob.glob(test_glob)):
         df = pd.read_parquet(path, columns=["person_id"])
-        person_ids_per_row.extend(df["person_id"].tolist())
+        pids = df["person_id"].tolist()
+        shard_first_pids.append(pids[0] if pids else None)
+        shard_row_counts.append(len(pids))
+        person_ids_per_row.extend(pids)
     person_ids_array = np.array(person_ids_per_row, dtype=np.int64)
     n_pid = len(np.unique(person_ids_array))
     print(f"  n_rows = {len(person_ids_array):,}   n_unique_persons = {n_pid:,}", flush=True)
@@ -186,6 +192,24 @@ def main() -> None:
             f"person_id count {len(person_ids_array)} != dataset size {n_dataset}; "
             f"test shards changed since pre-scan?"
         )
+    # Per-shard first-row sanity check — guards against any future pyarrow/engine
+    # change that reorders rows on read. We verify the dataset's row at each
+    # shard's starting index matches the person_id we recorded during pre-scan.
+    cum = 0
+    for shard_idx, (first_pid, n_rows) in enumerate(zip(shard_first_pids, shard_row_counts)):
+        if first_pid is None:
+            cum += n_rows
+            continue
+        ds_first_pid = int(test_loader.dataset.frames[shard_idx].iloc[0]["person_id"])
+        if ds_first_pid != first_pid:
+            raise RuntimeError(
+                f"shard {shard_idx} pre-scan first person_id {first_pid} != "
+                f"dataset.frames[{shard_idx}].iloc[0].person_id {ds_first_pid}. "
+                f"parquet row-order differs between pre-scan and dataset read — "
+                f"cluster bootstrap would mis-assign person_ids. ABORT."
+            )
+        cum += n_rows
+    print(f"  per-shard first-row person_id parity verified across {len(shard_first_pids)} shards  (OK)", flush=True)
 
     # Forward pass — collect predictions per endpoint, preserving row order
     preds: dict[str, list] = {ep: [] for ep in ENDPOINTS}
