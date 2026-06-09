@@ -408,12 +408,24 @@ def encode_window(
                 feats[d_idx, 10] = float(np.std(valid))
         mask[d_idx] = any_data
 
-    # EHR events INSIDE the input window only
-    ew = ehr_in_window[(ehr_in_window["d"] >= start) & (ehr_in_window["d"] < end_date)].copy()
-    ew["day_idx"] = ((ew["d"] - start).dt.days).astype(np.int16)
-    ehr_token_ids = ew["token_id"].values.astype(np.int32)
-    ehr_day_indices = ew["day_idx"].values.astype(np.int16)
-    ehr_token_types = ew["token_type"].values.astype(np.uint8)
+    # EHR events INSIDE the input window only.
+    # The empty-DataFrame fallback path (no events for this pid) has object-dtype
+    # "d", so (ew["d"] - start) raises TypeError on numpy scalars. Guard explicitly.
+    if len(ehr_in_window) > 0:
+        ew = ehr_in_window[
+            (ehr_in_window["d"] >= start) & (ehr_in_window["d"] < end_date)
+        ].copy()
+    else:
+        ew = ehr_in_window.iloc[0:0]
+    if len(ew) > 0:
+        day_idx = (pd.to_datetime(ew["d"]) - start).dt.days.astype(np.int16)
+        ehr_token_ids = ew["token_id"].to_numpy().astype(np.int32)
+        ehr_day_indices = day_idx.to_numpy()
+        ehr_token_types = ew["token_type"].to_numpy().astype(np.uint8)
+    else:
+        ehr_token_ids = np.zeros(0, dtype=np.int32)
+        ehr_day_indices = np.zeros(0, dtype=np.int16)
+        ehr_token_types = np.zeros(0, dtype=np.uint8)
 
     # Labels: any cardio event of each type in (end_date, end_date + 30d]
     horizon_end = end_date + pd.Timedelta(days=N_DAYS_HORIZON)
