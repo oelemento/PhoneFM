@@ -122,15 +122,23 @@ def naive_bootstrap_metric(y_true, y_pred, metric_fn, n_boot=500, rng_seed=20260
 
 def test_cluster_ci_wider_than_naive():
     print("\n=== Test 2: cluster CI is WIDER than naive CI on correlated data ===")
-    y_true, y_pred, pids = make_clustered_data(n_persons=200, windows_per_person=5)
+    # Use HARDER predictions: noise=0.30 so positives/negatives overlap
+    # significantly (point AUROC ~0.80). At AUROC saturation (~1.0) both
+    # bootstraps give tiny CIs that don't show the cluster effect — the
+    # cluster-vs-naive distinction only manifests when there's enough
+    # variance for sqrt(windows_per_person) scaling to be visible.
+    y_true, y_pred, pids = make_clustered_data(
+        n_persons=200, windows_per_person=5, pred_noise=0.30,
+    )
     cluster = ev.cluster_bootstrap_metric(y_true, y_pred, pids, roc_auc_score, n_boot=500)
     naive = naive_bootstrap_metric(y_true, y_pred, roc_auc_score, n_boot=500)
     cluster_width = cluster['hi'] - cluster['lo']
     naive_width = naive['hi'] - naive['lo']
     ratio = cluster_width / max(naive_width, 1e-9)
+    print(f"  point AUROC = {cluster['point']:.4f}  (lowered via pred_noise=0.30 so CI ratio is visible)")
     print(f"  naive   CI width = {naive_width:.4f}  ({naive['lo']:.4f}, {naive['hi']:.4f})")
     print(f"  cluster CI width = {cluster_width:.4f}  ({cluster['lo']:.4f}, {cluster['hi']:.4f})")
-    print(f"  cluster/naive ratio = {ratio:.2f}  (expect > 1.5 for highly-clustered data)")
+    print(f"  cluster/naive ratio = {ratio:.2f}  (expect > 1.5 for windows_per_person=5)")
     assert ratio > 1.5, \
         f"cluster CI should be ~sqrt(windows_per_person)=2.2× wider; got {ratio:.2f}"
     print("  PASS — cluster bootstrap correctly captures within-cluster correlation")
