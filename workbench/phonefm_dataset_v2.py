@@ -84,6 +84,11 @@ class PhoneFMV2Dataset(Dataset):
         wearable_feats = np.frombuffer(
             row["wearable_feats"], dtype=np.float32
         ).reshape(self.n_days, self.n_wearable_features).copy()
+        # Defensively zero out NaN/inf: a handful of windows had a few NaN
+        # values leak through (sleep_onset_hour when the LEFT JOIN to
+        # sleep_level returned NULL). Over ~50 batches those poisoned the
+        # BatchNorm running stats and produced NaN loss at step 50.
+        np.nan_to_num(wearable_feats, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
         wearable_mask = np.frombuffer(row["wearable_mask"], dtype=np.bool_).copy()
         ehr_ids = np.frombuffer(row["ehr_token_ids"], dtype=np.int32).copy()
         ehr_day = np.frombuffer(row["ehr_day_indices"], dtype=np.int16).copy().astype(np.int64)
@@ -91,6 +96,7 @@ class PhoneFMV2Dataset(Dataset):
         confounders = np.frombuffer(
             row["confounders"], dtype=np.float32
         ).reshape(self.n_confounders).copy()
+        np.nan_to_num(confounders, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
         labels = {ep: int(row[f"label_{ep}"]) for ep in ENDPOINTS}
         return {
