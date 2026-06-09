@@ -47,9 +47,15 @@ HP: dict[str, Any] = dict(
     d_model=384, n_layers=6, n_heads=6, d_ff=1536, dropout=0.1, max_seq_len=512,
     # optimisation
     batch_size=32, grad_accum=2,             # effective batch 64
-    lr=3e-4, weight_decay=0.1, warmup_steps=500, epochs=10, grad_clip=1.0,
+    # lr=1e-4 (was 3e-4) — the first attempt produced NaN at step 50 because
+    # the combination of pos_weight + WeightedRandomSampler doubled class
+    # balancing and gradients exploded under the 3e-4 schedule.
+    lr=1e-4, weight_decay=0.1, warmup_steps=1000, epochs=10, grad_clip=1.0,
     # data
-    balance_on="composite",
+    # balance_on=None (was "composite") — pos_weight in BCE already balances
+    # classes; sampling positives 10× more *and* multiplying their loss by
+    # pos_weight is double-correction and was the primary NaN trigger.
+    balance_on=None,
     # which head to use for "best" tracking; sum of endpoint AUROCs is more
     # discriminating than composite alone since multi-head training may differ
     # per endpoint
