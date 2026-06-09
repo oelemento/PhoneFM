@@ -66,15 +66,15 @@ class PhoneFMV2Config:
 
     # demographics / baseline confounders
     n_confounders: int = 8
-    # ordering:
-    #   0: age (years, standardised)
+    # ordering MUST match 02_tokenizer_v2.precompute_confounders output:
+    #   0: age (years, raw — model learns scaling via the input Linear)
     #   1: sex_female (0/1)
-    #   2: bmi (standardised)
-    #   3: baseline_cad (0/1)
-    #   4: baseline_cancer (0/1)
-    #   5: smoking_100cigs (0/1)
-    #   6: alcohol_ever (0/1)
-    #   7: sbp_systolic_mmHg (standardised)
+    #   2: bmi (kg/m^2, raw)
+    #   3: sbp (mmHg, raw — systolic)
+    #   4: dbp (mmHg, raw — diastolic)
+    #   5: baseline_cad (0/1)
+    #   6: baseline_cancer (0/1)
+    #   7: prior_afib (0/1 — useful when training new-incident-AFib head)
 
     # heads
     n_endpoint_heads: int = 4   # afib, mi, hf, cv_death
@@ -139,9 +139,12 @@ class MultiHeadSelfAttention(nn.Module):
         v = self.v_proj(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         q, k = apply_rope(q, k, cos, sin)
         # key_padding_mask: (B, L) bool, True = valid (keep), False = pad
+        # PyTorch SDPA boolean attn_mask: True = PARTICIPATE in attention (keep).
+        # So we pass key_padding_mask directly — do NOT negate (was a bug in earlier draft
+        # that caused the model to attend ONLY to PAD positions and ignore real tokens).
         attn_mask = None
         if key_padding_mask is not None:
-            attn_mask = (~key_padding_mask)[:, None, None, :]  # (B,1,1,L), True = mask out
+            attn_mask = key_padding_mask[:, None, None, :]  # (B,1,1,L), True = keep
         out = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_p if self.training else 0.0
         )

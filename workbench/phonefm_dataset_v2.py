@@ -214,15 +214,26 @@ def make_loader_v2(
 
 
 def report_label_distribution(shards_glob: str) -> dict[str, dict[str, float]]:
-    """Diagnostic for setting pos_weight per endpoint."""
+    """Diagnostic for setting pos_weight per endpoint.
+
+    Important: endpoints with n_pos==0 get pos_weight_for_bce=1.0 (NOT n/1) so the
+    loss is not blown up by a non-existent positive class. The training loop should
+    additionally drop such heads from the loss; this function only ensures the
+    weight is benign if it slips through.
+    """
     frames = [pd.read_parquet(p) for p in sorted(glob.glob(shards_glob))]
     n = sum(len(f) for f in frames)
     out = {}
     for ep in ENDPOINTS:
         col = np.concatenate([f[f"label_{ep}"].values for f in frames])
         n_pos = int(col.sum())
+        if n_pos == 0:
+            # No positives in this split: keep weight benign and flag.
+            pos_weight = 1.0
+        else:
+            pos_weight = (n - n_pos) / n_pos
         out[ep] = {
-            "n": n, "n_pos": n_pos, "pos_rate": n_pos / n,
-            "pos_weight_for_bce": (n - n_pos) / max(n_pos, 1),
+            "n": n, "n_pos": n_pos, "pos_rate": n_pos / max(n, 1),
+            "pos_weight_for_bce": float(pos_weight),
         }
     return out

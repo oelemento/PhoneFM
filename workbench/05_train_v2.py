@@ -91,6 +91,14 @@ for ep, s in train_stats.items():
           f"  pos_rate={s['pos_rate']:.4f}  pos_weight={s['pos_weight_for_bce']:.2f}")
 
 POS_WEIGHTS = {ep: train_stats[ep]["pos_weight_for_bce"] for ep in ENDPOINTS}
+# Drop any endpoint with zero training positives from the loss (head_weight=0).
+# Training such a head would push it toward all-negative, wasting capacity without
+# learning anything useful. The head still computes a logit at eval time but does
+# not contribute to gradients.
+HEAD_WEIGHTS = {ep: (1.0 if train_stats[ep]["n_pos"] > 0 else 0.0) for ep in ENDPOINTS}
+_dropped = [ep for ep, w in HEAD_WEIGHTS.items() if w == 0.0]
+if _dropped:
+    print(f"WARNING: dropping heads {_dropped} from loss (zero positives in train)", flush=True)
 
 
 # ============================================================
@@ -193,7 +201,7 @@ for epoch in range(HP["epochs"]):
                 batch["attn_mask"].to(DEVICE),
             )
             labels = {k: v.to(DEVICE) for k, v in batch["labels"].items()}
-            loss = multihead_bce_loss(out, labels, POS_WEIGHTS) / HP["grad_accum"]
+            loss = multihead_bce_loss(out, labels, POS_WEIGHTS, HEAD_WEIGHTS) / HP["grad_accum"]
 
         loss.backward()
 
