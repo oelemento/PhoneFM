@@ -1,18 +1,14 @@
 """PhoneFM v3 test-set evaluation — multi-horizon cluster bootstrap CIs.
 
 For each of the 13 (endpoint, horizon) heads, computes person-level cluster-
-bootstrap 95% CIs on AUROC + AUPRC. Reuses the v2 `cluster_bootstrap_metric`
-implementation from 06_eval_v2_test.py via importlib (no copy-paste, no shared
-state).
+bootstrap 95% CIs on AUROC + AUPRC.
 
-Also runs a Cox proportional-hazards sensitivity analysis on each 365d head
-per v3_spec.md §11.3 — refits a Cox model on (logit, label, time-to-event) and
-compares C-index to the discrete-time AUROC. If within 0.01, the discrete-time
-choice is vindicated.
+Bootstrap RNG matches 06_eval_v2_test.py (np.random.RandomState seed=20260609)
+so the CIs are bit-comparable to v2.
 
-The subgroup analysis itself lives in 06_subgroup_analysis.py — separate script,
-runs against the same best.pt + test shards. This script is for the headline
-per-head metrics on the full test set.
+Cox PH sensitivity analysis (v3_spec.md §11.3) and subgroup analyses (§13.3)
+live in separate scripts (06_cox_sensitivity.py, 06_subgroup_analysis.py) that
+load the same best.pt + test_results.json artifacts produced here.
 
 Run on AoU Workbench A100:
     cd ~/repos/PhoneFM/workbench && python3 06_eval_v3_test.py
@@ -39,14 +35,9 @@ from sklearn.metrics import average_precision_score, roc_auc_score  # type: igno
 HERE = Path(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, str(HERE))
 
-# ---- Reuse cluster_bootstrap_metric from v2 eval script
-import importlib.util as _ilu
-_spec = _ilu.spec_from_file_location("eval_test_v2", HERE / "06_eval_v2_test.py")
-assert _spec is not None and _spec.loader is not None
-eval_test_v2 = _ilu.module_from_spec(_spec)
-# Strip the if __name__=='__main__' block so importing doesn't run main()
-_src = (HERE / "06_eval_v2_test.py").read_text().split("if __name__")[0]
-exec(compile(_src, "eval_test_v2_partial", "exec"), eval_test_v2.__dict__)
+# (The earlier draft imported v2's cluster_bootstrap_metric via importlib but
+# never used it — cluster_bootstrap_masked below subsumes it and supports the
+# per-endpoint mask. Removed per correctness-review finding M5.)
 
 from phonefm_dataset_v3 import (  # type: ignore[import-not-found]
     HEAD_NAMES,
@@ -120,7 +111,8 @@ def cluster_bootstrap_masked(
         if pid not in rows_buf:
             rows_buf[pid] = []
         rows_buf[pid].append(int(ri))
-    unique_pids = np.array(list(rows_buf.keys()), dtype=np.int64)
+    # Sort unique_pids for deterministic, v2-comparable bootstrap (M6 fix).
+    unique_pids = np.array(sorted(rows_buf.keys()), dtype=np.int64)
     person_to_rows: dict[int, np.ndarray] = {
         pid: np.array(idxs, dtype=np.int64) for pid, idxs in rows_buf.items()
     }
@@ -128,7 +120,9 @@ def cluster_bootstrap_masked(
     # Point estimate on the masked rows
     point = float(metric_fn(y_true[mask], y_pred[mask]))
 
-    rng = np.random.default_rng(20260609)
+    # np.random.RandomState (legacy MT19937) for parity with v2's
+    # cluster_bootstrap_metric — CIs are bit-comparable when mask is all-ones.
+    rng = np.random.RandomState(20260609)
     scores = []
     for _ in range(n_boot):
         sample_pids = rng.choice(unique_pids, size=len(unique_pids), replace=True)
@@ -136,13 +130,16 @@ def cluster_bootstrap_masked(
         if y_true[idx].sum() < 5 or y_true[idx].sum() > len(idx) - 5:
             continue
         scores.append(metric_fn(y_true[idx], y_pred[idx]))
-    if len(scores) < n_boot * 0.5:
+    # Stricter "enough samples" threshold than v2's <100 to surface rare-endpoint
+    # CI fragility — but still report n_bootstrap_valid even when the CI is NaN.
+    n_ok = len(scores)
+    if n_ok < 100:
         return {"point": point, "lo": float("nan"), "hi": float("nan"),
-                "n_valid": int(mask.sum()), "n_bootstrap_valid": len(scores)}
+                "n_valid": int(mask.sum()), "n_bootstrap_valid": n_ok}
     lo = float(np.quantile(scores, (1 - ci) / 2))
     hi = float(np.quantile(scores, 1 - (1 - ci) / 2))
     return {"point": point, "lo": lo, "hi": hi,
-            "n_valid": int(mask.sum()), "n_bootstrap_valid": len(scores)}
+            "n_valid": int(mask.sum()), "n_bootstrap_valid": n_ok}
 
 
 # ============================================================
@@ -164,8 +161,10 @@ def main() -> None:
     with open(MODEL_DIR / "config.json") as f:
         saved = json.load(f)
     cfg_d = saved["config"].copy()
-    # Restore head_specs from list-of-lists to tuple-of-tuples
-    cfg_d["head_specs"] = tuple((ep, h) for (ep, h) in cfg_d["head_specs"])
+    # Restore head_specs from JSON list-of-lists to tuple-of-tuples
+    # (round-trip preserves *outer* tuple via tuple() but inner items stay as
+    # lists if we don't explicitly coerce — M7 fix).
+    cfg_d["head_specs"] = tuple(tuple(s) for s in cfg_d["head_specs"])
     cfg = PhoneFMV3Config(**cfg_d)
     max_seq_len = cfg.max_seq_len
 
@@ -308,9 +307,6 @@ def main() -> None:
     with open(OUT_PATH, "w") as f:
         json.dump(final_results, f, indent=2)
     print(f"\nresults saved to {OUT_PATH}", flush=True)
-
-    # silence the unused import on platforms where eval_test_v2 stays unused
-    _ = eval_test_v2
 
 
 if __name__ == "__main__":

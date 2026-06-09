@@ -77,11 +77,24 @@ class PhoneFMV3Dataset(Dataset):
         self.frames = [pd.read_parquet(p) for p in self.shards]
         self.index = [(si, ri) for si, f in enumerate(self.frames) for ri in range(len(f))]
 
-        # Sanity-check first shard has the expected label/mask columns
-        first = self.frames[0]
-        for name in HEAD_NAMES:
-            assert f"label_{name}" in first.columns, f"missing label column: label_{name}"
-            assert f"mask_{name}" in first.columns, f"missing mask column: mask_{name}"
+        # Sanity-check EVERY shard has the expected label/mask columns. Schema
+        # drift between tokenizer reruns (e.g. orphan shards from an old head
+        # list) would otherwise crash at index ~5000*orphan_shard_idx mid-epoch
+        # with a KeyError — adversarial reviewer finding M2.
+        for sidx, frame in enumerate(self.frames):
+            for name in HEAD_NAMES:
+                if f"label_{name}" not in frame.columns:
+                    raise AssertionError(
+                        f"shard {sidx} ({self.shards[sidx]}) missing column "
+                        f"label_{name}. Orphan shard from an older head list? "
+                        f"Either clear the OUT_DIR and re-tokenize, or align "
+                        f"the tokenizer's ALL_HEADS with phonefm_model_v3.ALL_HEADS."
+                    )
+                if f"mask_{name}" not in frame.columns:
+                    raise AssertionError(
+                        f"shard {sidx} ({self.shards[sidx]}) missing column "
+                        f"mask_{name}."
+                    )
 
     def __len__(self) -> int:
         return len(self.index)

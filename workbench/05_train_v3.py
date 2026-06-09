@@ -117,6 +117,32 @@ if _dropped:
     print(f"WARNING: dropping heads {_dropped} from loss "
           f"(<{HP['min_pos_for_training']} positives in train)", flush=True)
 
+# Preflight: verify val has enough positives for the best-metric primary heads.
+# If we skip this, a tiny val + rare endpoint produces NaN AUROC for every
+# primary head → sum_primary_auroc = 0.0 every epoch → best.pt saves at epoch 0
+# with random-init heads, then early-stops with effectively no supervised
+# training applied. Adversarial reviewer's silent-failure scenario.
+val_stats = report_label_distribution(str(DATA_DIR / "val_*.parquet"))
+print("val label distribution (after baseline-exclusion mask):")
+for name, s in val_stats.items():
+    print(f"  {name:<28s} n_valid={s['n_valid']:>7,d}  n_pos={s['n_pos']:>6,d}", flush=True)
+
+_VAL_NPOS_MIN = 5
+_primary_npos = {h: val_stats[h]["n_pos"] for h in PRIMARY_BEST_METRIC_HEADS if h in val_stats}
+_primary_viable = [h for h, n in _primary_npos.items() if n >= _VAL_NPOS_MIN]
+_primary_starved = [h for h, n in _primary_npos.items() if n < _VAL_NPOS_MIN]
+if not _primary_viable:
+    raise RuntimeError(
+        f"All primary best-metric heads have val n_pos < {_VAL_NPOS_MIN}: "
+        f"{_primary_npos}. The sum-of-primary-AUROC metric would be 0.0 every "
+        f"epoch and best.pt would never reflect actual training. Either lower "
+        f"_VAL_NPOS_MIN, switch best-metric, or fix the val split."
+    )
+if _primary_starved:
+    print(f"WARNING: primary heads starved in val (n_pos<{_VAL_NPOS_MIN}): {_primary_starved}. "
+          f"Best-metric will be sum over the {len(_primary_viable)} viable primary heads "
+          f"{_primary_viable}.", flush=True)
+
 
 # ============================================================
 # Model — fresh v3, then load pretrained backbone
@@ -225,14 +251,21 @@ def evaluate(loader) -> dict:
     return metrics
 
 
-def sum_primary_auroc(metrics: dict[str, float]) -> float:
-    """Sum of AUROCs across the 4 PRIMARY_BEST_METRIC_HEADS, skipping NaNs."""
+def sum_primary_auroc(metrics: dict[str, float]) -> tuple[float, int]:
+    """Sum of AUROCs across PRIMARY_BEST_METRIC_HEADS, skipping NaN heads.
+
+    Returns (sum, n_contributing_heads). Callers should treat n=0 as a
+    degenerate epoch (no primary head returned a real AUROC) and NOT save
+    best.pt against it — see the eval block below.
+    """
     score = 0.0
+    n_contrib = 0
     for h in PRIMARY_BEST_METRIC_HEADS:
         v = metrics.get(f"{h}_auroc", float("nan"))
         if not math.isnan(v):
             score += v
-    return score
+            n_contrib += 1
+    return score, n_contrib
 
 
 # ============================================================
@@ -290,23 +323,30 @@ for epoch in range(HP["epochs"]):
     # End-of-epoch eval + checkpoint
     print(f"--- evaluating epoch {epoch} ---", flush=True)
     val_m = evaluate(val_loader)
-    score = sum_primary_auroc(val_m)
+    score, n_contrib = sum_primary_auroc(val_m)
     summary_lines = []
     for name in HEAD_NAMES:
         au = val_m.get(f"{name}_auroc", float("nan"))
         if not math.isnan(au):
             summary_lines.append(f"{name}:AUROC={au:.4f}")
-    print(f"=== epoch {epoch}  sum_primary_auroc={score:.4f}  ===", flush=True)
+    print(f"=== epoch {epoch}  sum_primary_auroc={score:.4f}  (n_heads_contributing={n_contrib}/{len(PRIMARY_BEST_METRIC_HEADS)})  ===", flush=True)
     print("  " + "  ".join(summary_lines), flush=True)
     metrics_log.append({"epoch": epoch, "step": step,
-                        "sum_primary_auroc": score, **val_m})
+                        "sum_primary_auroc": score,
+                        "n_primary_heads_contributing": n_contrib, **val_m})
     with open(OUT_DIR / "metrics.json", "w") as f:
         json.dump(metrics_log, f, indent=2)
 
     # last.pt every epoch (cheap insurance against crash mid-run)
     torch.save(model.state_dict(), OUT_DIR / "last.pt")
 
-    if score > best_score:
+    # Refuse to save best.pt if no primary head contributed a real AUROC.
+    # Adversarial reviewer's failure mode: tiny val + rare endpoint → all primary
+    # AUROCs NaN → score=0.0 every epoch → epoch-0 random-init heads saved as best.
+    if n_contrib == 0:
+        print(f"  REFUSING to save best.pt: 0 primary heads contributed AUROC. "
+              f"score=0.0 is a degenerate metric, not a real improvement.", flush=True)
+    elif score > best_score:
         best_score = score
         best_epoch = epoch
         no_improve = 0

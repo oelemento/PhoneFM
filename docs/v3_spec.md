@@ -563,17 +563,24 @@ v2 took 5 mid-training restarts to find stable hyperparams. v3 must verify the f
 
 ### 14.10 best_metric = sum of primary endpoint AUROCs
 
-v2 used `best_metric=afib_auroc` because AFib was the cleanest signal and one of two primary endpoints. v3 has 4 primary-domain (endpoint, horizon) pairs that we care about equally:
+v2 used `best_metric=afib_auroc` because AFib was the cleanest signal and one of two primary endpoints. v3 has 4 primary-domain (endpoint, horizon) pairs that we care about equally. Note: the AFib head from v2 has been merged into `cv_composite` per §2 — there is no standalone `afib_*` head in v3.
 
 ```python
-PRIMARY_HEADS = ['afib_30d', 'mortality_365d', 't2d_365d', 'dep_365d']
+PRIMARY_BEST_METRIC_HEADS = ['cv_composite_30d', 'mortality_365d', 't2d_365d', 'dep_365d']
 HP['best_metric_formula'] = 'sum_primary_auroc'
-# In the eval block:
-best_score = sum(val_m[f'{h}_auroc'] for h in PRIMARY_HEADS
-                 if not math.isnan(val_m[f'{h}_auroc']))
+# In the eval block (must guard against all-NaN scores from rare endpoints
+# in tiny val splits — see correctness-review finding C3):
+score, n_contrib = sum_primary_auroc(val_m)   # see phonefm_model_v3
+if n_contrib == 0:
+    # All 4 primary AUROCs NaN — refuse to save best.pt for this epoch.
+    ...
+elif score > best_score:
+    ...
 ```
 
 This prevents the `best.pt` selection from chasing one endpoint at the expense of others. Sum-of-AUROCs is a stable, monotone metric across all four heads.
+
+A startup preflight in `05_train_v3.py` rejects val splits where every primary head has `n_pos < 5` (which would make this metric degenerate).
 
 ### 14.11 Training time + cost expectations from v2
 

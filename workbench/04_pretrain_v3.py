@@ -60,7 +60,9 @@ HP: dict[str, Any] = dict(
     # masking
     mask_rate=0.15,                # fraction of valid wearable days to mask
     # backbone (must match v2 / v3 supervised so we can transfer state_dict)
-    d_model=384, n_layers=6, n_heads=6, d_ff=1536, dropout=0.1,
+    # dropout=0.15 per v3_spec.md §14.2 — pretrain regime should match the
+    # regularization scale the backbone sees during fine-tuning.
+    d_model=384, n_layers=6, n_heads=6, d_ff=1536, dropout=0.15,
     n_wearable_features=11,
     n_token_types=8,
     vocab_size=6007,
@@ -273,14 +275,17 @@ class PhoneFMPretrainV3(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
 
-        # confounders intentionally NOT used during pretraining; placeholder
-        # kept so the state_dict layout stays compatible with v3 supervised.
-        self.confounder_input_norm = nn.BatchNorm1d(cfg.n_confounders)
-        self.confounder_proj = nn.Sequential(
-            nn.Linear(cfg.n_confounders, cfg.d_model),
-            nn.GELU(),
-            nn.Linear(cfg.d_model, cfg.d_model),
-        )
+        # Confounder layers intentionally OMITTED from the pretrain model:
+        # (a) pretraining never sees confounders (forward signature has no
+        #     confounders arg), so the layers would be unused random init;
+        # (b) v2 uses n_confounders=8 but v3 uses 9 (adds baseline_osa).
+        #     If we placed shape-8 layers in this state_dict, they'd serialize
+        #     into backbone_only.pt and crash v3's load_state_dict with a size
+        #     mismatch — strict=False does NOT silence shape mismatches.
+        # The v3 supervised model creates its own randomly-initialized
+        # confounder_input_norm + confounder_proj with the correct shape;
+        # load_pretrained_backbone uses strict=False so the missing keys are
+        # expected (see phonefm_model_v3.load_pretrained_backbone).
 
         self.rope = RotaryPositionalEmbedding(d_head=cfg.d_model // cfg.n_heads, max_positions=256)
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
@@ -490,9 +495,19 @@ def main() -> None:
         if val_mse < best_val:
             best_val = val_mse
             torch.save(model.state_dict(), OUT_DIR / "best.pt")
+            # backbone_only.pt: keep ONLY the keys that exist in v3 supervised
+            # PhoneFMV3 with matching shapes. That excludes:
+            #   - pretrain_head.*   (regression head; v3 has supervised heads)
+            #   - target_std        (buffer specific to pretrain loss scaling)
+            # Any unexpected key in this state would cause 05_train_v3.py's
+            # load_pretrained_backbone guard to RAISE (intentional — it's a
+            # mismatch signal). Keep this list aligned with PhoneFMV3.
+            _EXCLUDE_PREFIXES = ("pretrain_head.",)
+            _EXCLUDE_KEYS = {"target_std"}
             backbone_state = {
                 k: v for k, v in model.state_dict().items()
-                if not k.startswith("pretrain_head.")
+                if not any(k.startswith(p) for p in _EXCLUDE_PREFIXES)
+                and k not in _EXCLUDE_KEYS
             }
             torch.save(backbone_state, OUT_DIR / "backbone_only.pt")
             with open(OUT_DIR / "config.json", "w") as f:

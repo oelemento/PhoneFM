@@ -525,10 +525,15 @@ def build_confounders(pid: int) -> np.ndarray:
 # ============================================================
 
 _SUBGROUP_CACHE: dict[int, dict[str, int]] = {}
+# Per-person actual birth date (pd.Timestamp at midnight) for true-age computation.
+# Populated by precompute_subgroup_metadata alongside _SUBGROUP_CACHE. Falls back
+# to year-of-birth-only when month/day are suppressed by AoU. None means "no
+# birth date at all"; encode_window_v3 falls back to year-diff in that case.
+_BIRTH_DATE_CACHE: dict[int, pd.Timestamp | None] = {}
 
 
 def precompute_subgroup_metadata() -> None:
-    """Per-person race/sex/SES/age fixed at first window encoding time."""
+    """Per-person race/sex/SES + birth date (for accurate age) fixed once."""
     cache = DATA_DIR / "subgroup_metadata_v3.parquet"
     if cache.exists():
         df = pd.read_parquet(cache)
@@ -538,6 +543,10 @@ def precompute_subgroup_metadata() -> None:
                 "sex_at_birth_concept_id": int(r.sex_at_birth_concept_id),
                 "ses_income_quartile": int(r.ses_income_quartile),
             }
+            bd = getattr(r, "birth_date", None)
+            _BIRTH_DATE_CACHE[r.person_id] = (
+                pd.Timestamp(bd).normalize() if bd is not None and not pd.isna(bd) else None
+            )
         print(f"loaded {len(df):,} subgroup metadata rows from cache", flush=True)
         return
 
@@ -545,7 +554,8 @@ def precompute_subgroup_metadata() -> None:
     sql = f"""
       SELECT person_id,
              COALESCE(race_concept_id, 0) AS race_concept_id,
-             COALESCE(sex_at_birth_concept_id, 0) AS sex_at_birth_concept_id
+             COALESCE(sex_at_birth_concept_id, 0) AS sex_at_birth_concept_id,
+             birth_datetime
       FROM `{CDR}.person`
       WHERE person_id IN UNNEST({pids})
     """
@@ -555,6 +565,11 @@ def precompute_subgroup_metadata() -> None:
     # default to 0 (missing) and refine in a follow-up pass if AoU exposes
     # income_concept_id directly.
     df["ses_income_quartile"] = 0
+    # AoU often suppresses month/day on birth_datetime for rare birthdates and
+    # leaves YYYY-01-01 as the default. We keep the value as-is; encode_window_v3
+    # falls back to year-difference if the date arithmetic is suspicious.
+    df["birth_date"] = pd.to_datetime(df["birth_datetime"], errors="coerce").dt.normalize()
+    df = df.drop(columns=["birth_datetime"])
     df.to_parquet(cache, compression="snappy")
     for r in df.itertuples(index=False):
         _SUBGROUP_CACHE[r.person_id] = {
@@ -562,6 +577,10 @@ def precompute_subgroup_metadata() -> None:
             "sex_at_birth_concept_id": int(r.sex_at_birth_concept_id),
             "ses_income_quartile": int(r.ses_income_quartile),
         }
+        bd = getattr(r, "birth_date", None)
+        _BIRTH_DATE_CACHE[r.person_id] = (
+            pd.Timestamp(bd).normalize() if bd is not None and not pd.isna(bd) else None
+        )
 
 
 # ============================================================
@@ -579,12 +598,20 @@ def _has_event_before(events_df: pd.DataFrame, before: pd.Timestamp,
 
 def _has_event_in_window(events_df: pd.DataFrame, lo: pd.Timestamp, hi: pd.Timestamp,
                          endpoint: str) -> bool:
-    """Any evidence for `endpoint` in (lo, hi]."""
+    """Any evidence for `endpoint` in [lo, hi].
+
+    Boundary inclusive on BOTH ends. Events on lo (== end_date) ARE counted as
+    in-horizon because (a) they would otherwise fall in neither the input
+    window (`d < end_date`) nor the horizon, silently producing label=0 for
+    true positives, and (b) leakage-wise, an event exactly on end_date was
+    NOT in the input window so this poses no train/test contamination.
+    See v3-spec adversarial review finding M1.
+    """
     if len(events_df) == 0:
         return False
     sel = (
         (events_df["endpoint"] == endpoint) &
-        (events_df["d"] > lo) & (events_df["d"] <= hi)
+        (events_df["d"] >= lo) & (events_df["d"] <= hi)
     )
     return bool(sel.any())
 
@@ -678,12 +705,12 @@ def encode_window_v3(
         label = 0
         if usable:
             if ep == "mortality":
-                label = int(any(end_date < d <= horizon_end for d in death_dates))
+                # Include events on exactly end_date (see _has_event_in_window
+                # for the boundary rationale — finding M1)
+                label = int(any(end_date <= d <= horizon_end for d in death_dates))
             elif ep in ("cv_composite",):
-                # cv_composite = any of afib/mi/hf in horizon (per v2 continuity)
-                # endpoint_pid carries 'cv_composite' rows from fetch_endpoint_events.
-                # We unioned dx_afib/dx_mi/dx_hf into a single 'cv_composite' endpoint
-                # label upstream — verify with the assertion below.
+                # cv_composite rows in endpoint_pid come from fetch_endpoint_events
+                # after the dx_afib/dx_mi/dx_hf rewrite in tokenize_split.
                 label = int(_has_event_in_window(endpoint_pid, end_date, horizon_end, "cv_composite"))
             else:
                 label = int(_has_event_in_window(endpoint_pid, end_date, horizon_end, ep))
@@ -697,7 +724,17 @@ def encode_window_v3(
     out["race_concept_id"] = int(sg.get("race_concept_id", 0))
     out["sex_at_birth_concept_id"] = int(sg.get("sex_at_birth_concept_id", 0))
     out["ses_income_quartile"] = int(sg.get("ses_income_quartile", 0))
-    out["age_at_end_date"] = int(max(0, end_date.year - (fb_start.year - int(confounders[0]))))
+    # Real age at end_date computed from year + month + day of birth (looked up
+    # in precompute_subgroup_metadata as `_BIRTH_DATE_CACHE`). Year-difference
+    # alone biases late-year births +1 age bin (finding M3). Fallback to year-
+    # diff when month/day are unavailable (AoU often suppresses month/day for
+    # privacy on rare birth dates).
+    birth_date = _BIRTH_DATE_CACHE.get(pid)
+    if birth_date is not None:
+        age_years = int((end_date - birth_date).days // 365)
+    else:
+        age_years = int(end_date.year - (fb_start.year - int(confounders[0])))
+    out["age_at_end_date"] = max(0, age_years)
     return out
 
 
