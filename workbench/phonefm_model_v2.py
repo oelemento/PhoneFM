@@ -199,14 +199,22 @@ class PhoneFMV2(nn.Module):
         # Type embedding (distinguishes wearable vs DX10 vs MED ...)
         self.type_emb = nn.Embedding(cfg.n_token_types, cfg.d_model)
 
-        # Wearable feature projection: float vector -> d_model
+        # Wearable feature projection: BatchNorm1d normalizes each of the 11
+        # input features per-channel before projection. Without this, raw inputs
+        # like daily steps (range 0-100,000) overflow bf16 intermediate values
+        # in Linear(11, 384) and produce NaN gradients within ~50 training
+        # steps even with conservative lr/pos_weight settings.
+        self.wearable_input_norm = nn.BatchNorm1d(cfg.n_wearable_features)
         self.wearable_proj = nn.Sequential(
             nn.Linear(cfg.n_wearable_features, cfg.d_model),
             nn.GELU(),
             nn.Linear(cfg.d_model, cfg.d_model),
         )
 
-        # Confounder projection: float vector -> d_model (added to CLS)
+        # Confounder projection: same per-feature normalization (age, BMI, SBP,
+        # etc. have very different scales: 60, 28, 130; raw values would
+        # produce identical bf16 overflow).
+        self.confounder_input_norm = nn.BatchNorm1d(cfg.n_confounders)
         self.confounder_proj = nn.Sequential(
             nn.Linear(cfg.n_confounders, cfg.d_model),
             nn.GELU(),
@@ -254,11 +262,17 @@ class PhoneFMV2(nn.Module):
 
         # Wearable mix-in: where token_type == WEARABLE, replace tok_emb contribution with wearable projection
         wearable_mask = (token_types == 3).unsqueeze(-1)  # (B, L, 1)
-        wearable_h = self.wearable_proj(wearable_feats)   # (B, L, d)
+        # BatchNorm1d expects (N, C) or (N, C, L); reshape (B, L, F) -> (B*L, F)
+        B, L, F = wearable_feats.shape
+        wearable_norm = self.wearable_input_norm(
+            wearable_feats.reshape(B * L, F)
+        ).reshape(B, L, F)
+        wearable_h = self.wearable_proj(wearable_norm)    # (B, L, d)
         h = torch.where(wearable_mask, wearable_h + self.type_emb(token_types), h)
 
-        # Confounders added to CLS (position 0)
-        h[:, 0, :] = h[:, 0, :] + self.confounder_proj(confounders)
+        # Confounders added to CLS (position 0) — input-normalized first.
+        confounders_norm = self.confounder_input_norm(confounders)
+        h[:, 0, :] = h[:, 0, :] + self.confounder_proj(confounders_norm)
 
         # RoPE
         cos, sin = self.rope(day_index)  # (B, L, d_head/2) each
