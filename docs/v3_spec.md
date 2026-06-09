@@ -6,6 +6,7 @@
 **Builds on:** v2 (commit `c62a31b` on `v2-dev`), val AFib AUROC 0.9229 after epoch 0
 
 **Changelog:**
+- v0.4 (2026-06-09): incorporate v2 training lessons — drop epochs 10→5 with early stopping (v2 peaked at epoch 2), inherit numerical stability defaults that took v2 5 mid-training restarts to discover, add pre-launch sanity assertions, bootstrap CI eval, sum-of-primary-AUROCs as best metric, larger-backbone ablation. See §14.
 - v0.3 (2026-06-09): adopt four enhancements per strategy review — self-supervised pre-training (stub committed at `workbench/04_pretrain_v3.py`), negative-control endpoints, discrete-time hazard framing, pre-registered subgroup analyses. PRS integration and iPhone deployment moved to future-work section.
 - v0.2 (2026-06-09): drop OSA as a primary outcome (AoU prevalence 2.5% vs. true ~25% → detection bias dominates); move OSA to baseline confounder. Document empirical OSA prevalence query results. Address Critical feasibility-reviewer findings on cohort size empirical check, SNOMED descendant traversal, and multi-source phenotyping.
 - v0.1 (2026-06-09): initial draft with 5 domains × 3 horizons.
@@ -338,6 +339,157 @@ Both are post-v3 paper-prep work.
 - [ ] Pick the final endpoint list (this draft proposes 4 primary domains + 3 negative controls = 13 heads)
 - [ ] Confirm max horizon (365d or 180d) — empirical cohort-size check still pending
 - [ ] Confirm baseline-exclusion strategy (per-endpoint mask vs. cohort drop)
-- [ ] Pick best_metric formula for `best.pt` selection (proposed: sum of primary-endpoint AUROCs)
+- [x] Pick best_metric formula for `best.pt` selection → §14.10: sum of primary-endpoint AUROCs
 - [ ] Decide whether to run v3 immediately or first validate v2 on test set
 - [ ] Confirm subgroup definitions JSON before any test-set evaluation
+
+---
+
+## 14. v2 lessons learned (must apply in v3)
+
+v2 trained successfully (AFib val AUROC 0.9285 at epoch 2, composite 0.8966 at epoch 0) but required 5 mid-training restarts and several failed runs to converge on stable hyperparameters and architectural defenses. The lessons below are mandatory inputs for v3 — not preferences.
+
+### 14.1 Reduce epochs 10 → 5 with early stopping
+
+v2 epoch-by-epoch AFib val AUROC: 0.9229 → 0.9202 → **0.9285** → 0.9105 → 0.9153 → 0.9248 → 0.9190 → 0.9248 (still in epoch 7 at write time). Peak at epoch 2; epochs 3-7 wasted ~$8 of A100 time learning nothing on the primary metric. Composite peaked at epoch 0. HF peaked at epoch 0.
+
+**v3 change:** `HP['epochs'] = 5`. Add early stopping: stop if best metric hasn't improved for 3 consecutive epochs. Saves ~$6 and 90 minutes per training run. With pre-training (§11.1) initializing the backbone, even 3 epochs may suffice.
+
+### 14.2 Inherit ALL v2 numerical stability defaults
+
+v2 NaN-trained 1100+ steps before the run was diagnosed and killed. Fixes that turned a NaN-spewing run into a converging one:
+
+```python
+HP = dict(
+    lr=1e-4,                  # was 3e-4 in initial v2; 3e-4 + multi-head BCE diverged
+    warmup_steps=1000,        # was 500; gentler ramp
+    weight_decay=0.15,        # was 0.1; v2 overfit HF/composite by epoch 3
+    dropout=0.15,             # was 0.1; same reason
+    grad_clip=1.0,
+    balance_on=None,          # DO NOT enable WeightedRandomSampler; pos_weight in BCE
+                              # alone handles class imbalance. v2 had both = double
+                              # balancing → NaN at step 50.
+    MAX_POS_WEIGHT=50,        # cap pos_weight to prevent BCE explosion when n_pos
+                              # is tiny (v2 cv_death had n_pos=3, raw pw=212,797)
+    MIN_POS_FOR_TRAINING=50,  # drop any head with fewer than 50 train positives
+                              # from the loss entirely (head_weight=0)
+)
+```
+
+Plus model-side defenses inherited from v2 `phonefm_model_v2.py`:
+- `BatchNorm1d` on wearable input (raw `steps` range 0-100k otherwise overflows bf16)
+- `BatchNorm1d` on confounder input (raw age/BMI/SBP same problem)
+- `nan_to_num` defensive zero in `PhoneFMV2Dataset.__getitem__` for any wearable_feats or confounders that slip through with NaN
+
+### 14.3 Empirically validated stability training recipe
+
+bf16 autocast with `cuda_autocast` from `torch.cuda.amp` (NOT `torch.amp.autocast` — doesn't exist on AoU image's torch 2.0.1). Loss is internally upcast to fp32 by `binary_cross_entropy_with_logits`. AdamW with `(0.9, 0.95)` betas. Cosine schedule.
+
+### 14.4 Test a larger backbone as v3.1-A vs v3.1-B comparison
+
+v2's 13.3M-param backbone plateaued at AFib AUROC ~0.93 by epoch 2 and never improved. This is consistent with *capacity* being the binding constraint, not training duration. v3 with 13 heads vs v2's 4 heads demands more representation per parameter.
+
+**Sub-ablation in v3.1:** train both `d_model=384, n_layers=6` (v2 default, 13M params) and `d_model=512, n_layers=12` (v1 scale, ~52M params) with the same pre-trained backbone + supervised heads. If the larger backbone gains ≥0.01 AUROC on AFib or mortality, it's worth the ~2× training cost.
+
+### 14.5 Add wearable_feats nonzero assertion at tokenizer start
+
+v2's "all-zero wearable_feats" failure (cohort timestamp midnight mismatch — see v3 spec changelog) wasted 1h45m + ~$5 of compute. The defense costs five lines:
+
+```python
+# In 02_tokenizer_v3.py, after writing the first shard:
+first_shard = OUT_DIR / f"train_0000.parquet"
+df = pd.read_parquet(first_shard)
+sample_feats = [np.frombuffer(df.iloc[i]['wearable_feats'], dtype=np.float32)
+                for i in range(min(10, len(df)))]
+max_val = max(arr.max() for arr in sample_feats)
+assert max_val > 100, f"wearable_feats all near-zero (max={max_val}). " \
+                      f"Tokenizer is producing degenerate output — abort."
+print(f"sanity OK: wearable_feats max = {max_val:.1f}")
+```
+
+This catches any future "tokenizer silently broke" class of bug in the first shard, not 6 hours into the full run.
+
+### 14.6 NaN guard at training step level
+
+```python
+# In the training loop, after loss.backward():
+if not torch.isfinite(loss).item():
+    print(f"NaN detected at step {step}; halting", flush=True)
+    raise RuntimeError("NaN loss")
+```
+
+v2 produced NaN loss for 1,100+ training steps before we noticed in the log. Hard halt prevents an entire wasted run.
+
+### 14.7 Environment setup script
+
+v2 cost 30 min on `numpy>=2.0` (broken vs torch 2.0.1) → `numpy<2` (broken vs pyarrow shipped against numpy 2). `setup_env.sh` to be sourced at the top of every training script:
+
+```bash
+#!/bin/bash
+set -e
+pip install --quiet 'numpy<2'
+pip install --quiet --force-reinstall --no-deps pyarrow
+python3 -c "import torch, numpy, pyarrow; \
+  print('numpy', numpy.__version__, 'torch', torch.__version__, \
+        'pyarrow', pyarrow.__version__); \
+  assert torch.from_numpy(numpy.zeros(3)).sum().item() == 0, 'torch<->numpy broken'; \
+  import pandas; pandas.read_parquet('/dev/null') if False else None"
+```
+
+Idempotent: costs nothing on a clean env, fixes the v2 compat issues once.
+
+### 14.8 Bootstrap CIs for low-positive endpoints
+
+v2 MI val AUROC bounced 0.7259 → 0.7728 → 0.7657 → 0.7984 → 0.7796 → 0.8306 across epochs purely from sampling variance (643 positives in val). v3 will have endpoints with substantially fewer positives:
+- mortality_30d: estimated ~50 positives (5% of v2 cohort with 30d horizon → ~600, but excluding short-followup people → ~50)
+- depression_180d: estimated ~200 positives
+- negative controls: by construction ~baseline rate (~1-5%)
+
+Raw point-estimate AUROC is meaningless without uncertainty quantification:
+
+```python
+from sklearn.utils import resample
+def bootstrap_auc(y_true, y_pred, n_boot=1000, ci=0.95):
+    aucs = []
+    for _ in range(n_boot):
+        idx = resample(np.arange(len(y_true)))
+        if y_true[idx].sum() < 5: continue   # skip degenerate resamples
+        aucs.append(roc_auc_score(y_true[idx], y_pred[idx]))
+    lo, hi = np.quantile(aucs, [(1-ci)/2, 1-(1-ci)/2])
+    return np.median(aucs), lo, hi
+```
+
+Report `AUROC (95% CI)` for every (endpoint, horizon) pair in the val/test log.
+
+### 14.9 Pre-launch checklist
+
+v2 took 5 mid-training restarts to find stable hyperparams. v3 must verify the following BEFORE the 5-hour training run starts:
+
+- [ ] Smoke test on tokenizer's first shard (wearable_feats nonzero, all label columns present, masks make sense)
+- [ ] 100-step dry run with `batch_size=4, max_steps=100, num_workers=0` and verbose logging
+- [ ] Code review on every new script ≥50 lines (the lesson from this very session — v3 already costs reviewer subagent + code reviewer subagent runs)
+- [ ] All four critical reviewer findings on the pretrain code (C1, C2, M3, M4) verified fixed via re-run of `04_pretrain_v3_smoke.py`
+- [ ] Tokenizer-level wearable_feats assertion passes
+- [ ] NaN-step guard installed in training loop
+
+### 14.10 best_metric = sum of primary endpoint AUROCs
+
+v2 used `best_metric=afib_auroc` because AFib was the cleanest signal and one of two primary endpoints. v3 has 4 primary-domain (endpoint, horizon) pairs that we care about equally:
+
+```python
+PRIMARY_HEADS = ['afib_30d', 'mortality_365d', 't2d_365d', 'dep_365d']
+HP['best_metric_formula'] = 'sum_primary_auroc'
+# In the eval block:
+best_score = sum(val_m[f'{h}_auroc'] for h in PRIMARY_HEADS
+                 if not math.isnan(val_m[f'{h}_auroc']))
+```
+
+This prevents the `best.pt` selection from chasing one endpoint at the expense of others. Sum-of-AUROCs is a stable, monotone metric across all four heads.
+
+### 14.11 Training time + cost expectations from v2
+
+v2 actuals (vs the prediction in v2 spec):
+- Predicted: ~17h on A100
+- Actual: ~3.4h (5x faster — seq_len=512 vs predicted 4096; smaller backbone)
+
+v3 actuals will track v2's ~3-4h despite adding 13 heads (pretrain initializes backbone faster + we'll cut epochs 10→5). Budget **~$15-20** of A100 time, not $50+. Stop the run early if metrics plateau before epoch 5.
