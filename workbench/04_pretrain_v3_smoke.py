@@ -158,22 +158,30 @@ def main() -> None:
     assert torch.isfinite(pred).all(), "non-finite pred — model broke"
     print(f"pred stats: mean={pred.mean().item():.4f}  std={pred.std().item():.4f}")
 
-    # ---- 7. Compute the loss two ways and assert equal ----
+    # ---- 7. Compute the production loss and verify it averages per scalar ----
     tgt = batch["wearable_target"].to(device)
-    mind = batch["mask_indicator"].to(device).unsqueeze(-1).float()
+    mask_b = batch["mask_indicator"].to(device).bool()
 
-    loss_A = ((pred - tgt) ** 2 * mind).sum() / mind.sum().clamp(min=1.0)
-    diff_sq_masked = ((pred - tgt) ** 2)[mind.squeeze(-1).bool()]
-    loss_B = diff_sq_masked.mean()
+    # Production formula (post-fix)
+    diff_sq_masked = ((pred - tgt) ** 2)[mask_b]    # (n_masked, F)
+    loss = (diff_sq_masked.mean() if mask_b.any()
+            else torch.zeros((), device=pred.device, dtype=pred.dtype))
 
-    print(f"\nloss_A (production) = {loss_A.item():.6f}")
-    print(f"loss_B (explicit)   = {loss_B.item():.6f}")
-    assert torch.allclose(loss_A, loss_B, rtol=1e-4), \
-        f"masked-MSE formula mismatch: A={loss_A.item()} vs B={loss_B.item()}"
-    print("masked-MSE formulas agree  (OK)")
+    # Independent re-derivation as sum-over-everything / (n_masked × F)
+    diff_sq_all = (pred - tgt) ** 2 * mask_b.unsqueeze(-1).float()
+    n_scalar_preds = mask_b.sum().item() * pred.shape[-1]
+    loss_re = diff_sq_all.sum() / max(1, n_scalar_preds)
+
+    print(f"\nproduction loss               = {loss.item():.6f}")
+    print(f"re-derived (sum/n_scalar_preds)= {loss_re.item():.6f}")
+    assert torch.allclose(loss, loss_re, rtol=1e-4), \
+        f"masked-MSE per-scalar formulas disagree: {loss.item()} vs {loss_re.item()}"
+    print(f"  n_masked_positions = {mask_b.sum().item()}, n_features = {pred.shape[-1]}, "
+          f"n_scalar_preds = {n_scalar_preds}")
+    print("masked-MSE per-scalar formula confirmed  (OK)")
 
     # ---- 8. Verify gradient flows to the backbone ----
-    loss_A.backward()
+    loss.backward()
     backbone_param = model.wearable_proj[0].weight
     assert backbone_param.grad is not None
     assert backbone_param.grad.abs().max().item() > 0, \
@@ -186,8 +194,10 @@ def main() -> None:
     print(f"pretrain_head.weight grad norm   = {head_param.grad.norm().item():.6f}  (OK)")
 
     # ---- 9. Edge case: divide-by-zero protection when no positions are masked ----
-    zero_mind = torch.zeros_like(mind)
-    loss_edge = ((pred - tgt) ** 2 * zero_mind).sum() / zero_mind.sum().clamp(min=1.0)
+    zero_mask = torch.zeros_like(mask_b, dtype=torch.bool)
+    diff_sq_zm = ((pred - tgt) ** 2)[zero_mask]   # empty (0, F)
+    loss_edge = (diff_sq_zm.mean() if zero_mask.any()
+                 else torch.zeros((), device=pred.device, dtype=pred.dtype))
     assert torch.isfinite(loss_edge), "divide-by-zero protection failed"
     assert loss_edge.item() == 0.0
     print(f"all-zero-mask edge case: loss = {loss_edge.item()} (no NaN, no inf)  (OK)")

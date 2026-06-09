@@ -360,8 +360,10 @@ def main() -> None:
 
     @torch.no_grad()
     def evaluate(loader) -> float:
+        """Returns per-scalar-prediction MSE (matches training loss scale)."""
         model.eval()
-        total_sq = 0.0; total_n = 0
+        total_sq = 0.0
+        total_n = 0
         for batch in loader:
             pred = model(
                 batch["input_ids"].to(DEVICE),
@@ -371,10 +373,10 @@ def main() -> None:
                 batch["attn_mask"].to(DEVICE),
             )
             tgt = batch["wearable_target"].to(DEVICE)
-            mask = batch["mask_indicator"].to(DEVICE).unsqueeze(-1)
-            sq = ((pred - tgt) ** 2 * mask).sum().item()
-            n = mask.sum().item() * tgt.shape[-1]
-            total_sq += sq; total_n += n
+            mask_b = batch["mask_indicator"].to(DEVICE).bool()
+            diff_sq = ((pred - tgt) ** 2)[mask_b]   # (n_masked, F)
+            total_sq += diff_sq.sum().item()
+            total_n += diff_sq.numel()              # = n_masked × F
         model.train()
         return total_sq / max(1, total_n)
 
@@ -397,9 +399,16 @@ def main() -> None:
                     batch["attn_mask"].to(DEVICE),
                 )
                 tgt = batch["wearable_target"].to(DEVICE)
-                mask = batch["mask_indicator"].to(DEVICE).unsqueeze(-1).float()
-                # MSE averaged over masked positions only
-                loss = ((pred - tgt) ** 2 * mask).sum() / mask.sum().clamp(min=1.0) / HP["grad_accum"]
+                mask_b = batch["mask_indicator"].to(DEVICE).bool()  # (B, L)
+                # MSE per scalar prediction (mean over both masked positions AND
+                # the n_wearable_features dim). Smoke test caught a bug where
+                # the previous formula divided by n_masked_positions instead of
+                # n_masked_positions × n_features → loss was n_features=11× too
+                # large per scalar, fine for ranking but mis-calibrated loss scale.
+                diff_sq_masked = ((pred - tgt) ** 2)[mask_b]   # (n_masked, F)
+                loss = (diff_sq_masked.mean() if mask_b.any()
+                        else torch.zeros((), device=pred.device, dtype=pred.dtype))
+                loss = loss / HP["grad_accum"]
 
             loss.backward()
             if (i + 1) % HP["grad_accum"] == 0:
