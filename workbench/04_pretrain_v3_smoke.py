@@ -8,18 +8,14 @@ and asserts the masked-MSE math is correct:
   - One known-zero edge case: if a batch has no masked positions, the loss
     must not divide-by-zero (clamp(min=1.0) check)
 
-Run on a machine that has /home/jupyter/workspace/phonefm-data/tokenized_v2/
-or pass --synthetic to use a 64-row in-memory shard.
+Falls back to a synthetic shard if real tokenized_v2 shards aren't mounted.
 
 Usage:
-    python3 04_pretrain_v3_smoke.py                # use real shards if present
-    python3 04_pretrain_v3_smoke.py --synthetic    # use fake shard, CPU-safe
+    cd ~/repos/PhoneFM/workbench && python3 04_pretrain_v3_smoke.py
 """
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
 import os
 import sys
 import tempfile
@@ -29,21 +25,31 @@ import numpy as np
 import pandas as pd  # type: ignore[import-not-found]
 import torch
 
+HERE = Path(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(HERE))
+
+# Direct imports — works because we add workbench/ to sys.path
+import importlib.util as _ilu
+_spec = _ilu.spec_from_file_location("pretrain_mod", HERE / "04_pretrain_v3.py")
+assert _spec is not None and _spec.loader is not None
+pretrain = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(pretrain)
+
+from phonefm_model_v2 import PhoneFMV2Config  # type: ignore[import-not-found]
+
 
 def make_synthetic_shard(path: Path, n_rows: int = 64) -> None:
     """Mimic the on-disk tokenized_v2 schema with random wearable values."""
     rows = []
     for i in range(n_rows):
         feats = (np.random.rand(180, 11).astype(np.float32) * 100).clip(min=0)
-        # Steps column at index 0 should be larger; matches real data scale
-        feats[:, 0] *= 100
+        feats[:, 0] *= 100  # steps column scaled up to match real data
         mask = (np.random.rand(180) > 0.05).astype(np.bool_)
         rows.append({
             "person_id": i,
             "end_date": pd.Timestamp("2024-01-01"),
             "wearable_feats": feats.tobytes(),
             "wearable_mask": mask.tobytes(),
-            # other v2 columns the smoke test doesn't read, but parquet needs them
             "ehr_token_ids": np.zeros(0, dtype=np.int32).tobytes(),
             "ehr_day_indices": np.zeros(0, dtype=np.int16).tobytes(),
             "ehr_token_types": np.zeros(0, dtype=np.uint8).tobytes(),
@@ -55,52 +61,19 @@ def make_synthetic_shard(path: Path, n_rows: int = 64) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--synthetic", action="store_true",
-                        help="use fake shard instead of real tokenized_v2")
-    args = parser.parse_args()
-
-    HERE = Path(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, str(HERE))
-
-    # Load the pretrain script as a module so we can reach its classes
-    spec = importlib.util.spec_from_file_location("pretrain", HERE / "04_pretrain_v3.py")
-    pretrain = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-
-    if args.synthetic:
-        # Patch DATA_DIR before exec_module so make_loader points at our tmpdir
-        tmpdir = Path(tempfile.mkdtemp(prefix="phonefm_smoke_"))
-        make_synthetic_shard(tmpdir / "train_0000.parquet", n_rows=64)
-        make_synthetic_shard(tmpdir / "val_0000.parquet", n_rows=32)
-        # Pre-set the module's DATA_DIR by reading source, swapping the constant
-        src = (HERE / "04_pretrain_v3.py").read_text()
-        src = src.replace(
-            'DATA_DIR = Path("/home/jupyter/workspace/phonefm-data/tokenized_v2")',
-            f'DATA_DIR = Path("{tmpdir}")',
-        )
-        # Run the patched module
-        exec(compile(src, "04_pretrain_v3_synth.py", "exec"), pretrain.__dict__)
-    else:
-        spec.loader.exec_module(pretrain)
-
     print(f"\n=== SMOKE TEST: 04_pretrain_v3.py ===\n")
 
-    # ---- 1. Build dataset + dataloader ----
-    real_data = Path("/home/jupyter/workspace/phonefm-data/tokenized_v2/train_0000.parquet").exists()
-    if args.synthetic or not real_data:
-        # Module already has the right DATA_DIR if --synthetic; otherwise use synthetic
-        if not args.synthetic:
-            print("(real shards missing — falling back to synthetic)")
-            tmpdir = Path(tempfile.mkdtemp(prefix="phonefm_smoke_"))
-            make_synthetic_shard(tmpdir / "train_0000.parquet", n_rows=64)
-            make_synthetic_shard(tmpdir / "val_0000.parquet", n_rows=32)
-            pretrain.DATA_DIR = tmpdir
-        shards_glob = str(pretrain.DATA_DIR / "train_*.parquet")
-    else:
+    real_data = (pretrain.DATA_DIR / "train_0000.parquet").exists()
+    if real_data:
         shards_glob = str(pretrain.DATA_DIR / "train_0000.parquet")
+        print(f"using real shard: {shards_glob}")
+    else:
+        tmpdir = Path(tempfile.mkdtemp(prefix="phonefm_smoke_"))
+        make_synthetic_shard(tmpdir / "train_0000.parquet", n_rows=64)
+        shards_glob = str(tmpdir / "train_0000.parquet")
+        print(f"real shards missing — using synthetic shard at {shards_glob}")
 
-    print(f"shards_glob = {shards_glob}")
+    # ---- 1. Build dataset + dataloader ----
     ds = pretrain.WearableMaskedDataset(shards_glob)
     print(f"dataset size: {len(ds)} rows")
     assert len(ds) > 0, "empty dataset"
@@ -141,7 +114,7 @@ def main() -> None:
     assert 0.05 < actual_rate < 0.35, f"mask rate {actual_rate} out of plausible range"
 
     # ---- 4. Verify masked positions have wearable_feats==0, target!=0 ----
-    masked_feats = batch["wearable_feats"][mask]   # (n_masked, F)
+    masked_feats = batch["wearable_feats"][mask]
     assert masked_feats.abs().max().item() < 1e-6, \
         "wearable_feats must be zero at masked positions"
     print(f"masked wearable_feats max abs = {masked_feats.abs().max().item():.6f}  (OK, ~0)")
@@ -150,14 +123,13 @@ def main() -> None:
     print(f"masked wearable_target stats: mean={masked_target.mean().item():.2f}  "
           f"max={masked_target.max().item():.2f}")
 
-    # ---- 5. Verify input_ids at masked positions = MASK_ID, elsewhere = WEARABLE_MARKER_ID/CLS/EOS ----
+    # ---- 5. Verify input_ids at masked positions = MASK_ID ----
     masked_ids = batch["input_ids"][mask]
     assert (masked_ids == pretrain.MASK_ID).all(), \
         f"input_ids at masked positions should all be {pretrain.MASK_ID}, got {masked_ids.unique()}"
     print(f"input_ids at masked positions: all MASK_ID={pretrain.MASK_ID}  (OK)")
 
     # ---- 6. Build the model and run forward ----
-    from phonefm_model_v2 import PhoneFMV2Config
     cfg = PhoneFMV2Config(
         d_model=pretrain.HP["d_model"],
         n_layers=pretrain.HP["n_layers"],
@@ -186,15 +158,12 @@ def main() -> None:
     assert torch.isfinite(pred).all(), "non-finite pred — model broke"
     print(f"pred stats: mean={pred.mean().item():.4f}  std={pred.std().item():.4f}")
 
-    # ---- 7. Compute the loss and verify masked-only behavior ----
+    # ---- 7. Compute the loss two ways and assert equal ----
     tgt = batch["wearable_target"].to(device)
     mind = batch["mask_indicator"].to(device).unsqueeze(-1).float()
 
-    # Loss computed two ways and asserted equal:
-    #   A) the production formula
     loss_A = ((pred - tgt) ** 2 * mind).sum() / mind.sum().clamp(min=1.0)
-    #   B) explicit per-position MSE only on masked positions
-    diff_sq_masked = ((pred - tgt) ** 2)[mind.squeeze(-1).bool()]   # (n_masked, F)
+    diff_sq_masked = ((pred - tgt) ** 2)[mind.squeeze(-1).bool()]
     loss_B = diff_sq_masked.mean()
 
     print(f"\nloss_A (production) = {loss_A.item():.6f}")
@@ -203,7 +172,7 @@ def main() -> None:
         f"masked-MSE formula mismatch: A={loss_A.item()} vs B={loss_B.item()}"
     print("masked-MSE formulas agree  (OK)")
 
-    # ---- 8. Verify gradient flows to the backbone (the SSL signal must train it) ----
+    # ---- 8. Verify gradient flows to the backbone ----
     loss_A.backward()
     backbone_param = model.wearable_proj[0].weight
     assert backbone_param.grad is not None
@@ -226,8 +195,7 @@ def main() -> None:
     # ---- 10. Verify backbone state_dict has no pretrain_head keys ----
     backbone_state = {k: v for k, v in model.state_dict().items()
                       if not k.startswith("pretrain_head.")}
-    assert not any(k.startswith("pretrain_head") for k in backbone_state)
-    head_state = {k for k in model.state_dict() if k.startswith("pretrain_head")}
+    head_state = [k for k in model.state_dict() if k.startswith("pretrain_head")]
     print(f"\nbackbone state has {len(backbone_state)} tensors; "
           f"strips {len(head_state)} pretrain_head tensors for fine-tune init  (OK)")
 
