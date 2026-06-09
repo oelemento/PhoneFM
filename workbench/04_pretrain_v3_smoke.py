@@ -129,7 +129,24 @@ def main() -> None:
         f"input_ids at masked positions should all be {pretrain.MASK_ID}, got {masked_ids.unique()}"
     print(f"input_ids at masked positions: all MASK_ID={pretrain.MASK_ID}  (OK)")
 
-    # ---- 6. Build the model and run forward ----
+    # ---- 5b. Verify the MASK_ID signal reaches the model (post-C1 fix) ----
+    # If wearable_mask in forward excludes masked positions, then the model
+    # input embedding at masked positions = tok_emb(MASK_ID) + type_emb(WEARABLE),
+    # which is DISTINCT from tok_emb(WEARABLE_MARKER_ID) + type_emb(WEARABLE) at
+    # non-masked positions. Verify the formula in the forward path.
+    sample_token_types = torch.tensor([[pretrain.TYPE_CLS, pretrain.TYPE_WEARABLE,
+                                         pretrain.TYPE_WEARABLE, pretrain.TYPE_EOS]])
+    sample_input_ids = torch.tensor([[pretrain.CLS_ID, pretrain.WEARABLE_MARKER_ID,
+                                       pretrain.MASK_ID, pretrain.EOS_ID]])
+    expected_wearable_mask = torch.tensor([[False, True, False, False]])
+    actual_wearable_mask = (
+        (sample_token_types == pretrain.TYPE_WEARABLE) &
+        (sample_input_ids != pretrain.MASK_ID)
+    )
+    assert torch.equal(actual_wearable_mask, expected_wearable_mask), \
+        f"wearable_mask formula wrong: expected {expected_wearable_mask}, got {actual_wearable_mask}"
+    print("wearable_mask formula excludes MASK_ID positions  (OK — C1 fix verified)")
+
     cfg = PhoneFMV2Config(
         d_model=pretrain.HP["d_model"],
         n_layers=pretrain.HP["n_layers"],

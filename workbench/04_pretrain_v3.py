@@ -217,6 +217,18 @@ def collate_masked(
     }
 
 
+def _worker_init(worker_id: int) -> None:
+    """Seed numpy independently per DataLoader worker.
+
+    PyTorch seeds Python's `random` and `torch.random` per worker but NOT numpy.
+    Without this, all forked workers inherit the parent's numpy RNG state and
+    produce identical 'random' subwindow starts + mask positions for the same
+    dataset index, silently degrading data diversity.
+    """
+    seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(seed)
+
+
 def make_loader(shards_glob: str, batch_size: int, shuffle: bool, num_workers: int = 4) -> DataLoader:
     ds = WearableMaskedDataset(
         shards_glob,
@@ -230,6 +242,7 @@ def make_loader(shards_glob: str, batch_size: int, shuffle: bool, num_workers: i
             HP["n_wearable_features"], HP["mask_rate"],
         ),
         pin_memory=True, persistent_workers=(num_workers > 0),
+        worker_init_fn=_worker_init,
     )
 
 
@@ -276,6 +289,12 @@ class PhoneFMPretrainV3(nn.Module):
         # Pretraining head — discarded for supervised fine-tune
         self.pretrain_head = nn.Linear(cfg.d_model, cfg.n_wearable_features)
 
+        # Per-feature std for loss standardization. Initialized to ones; set
+        # to actual training-data std by compute_target_std() before training
+        # begins. Without this, the MSE is dominated by the steps feature
+        # (range 0-100k) and sleep_onset (range 0-24) gets ~0 gradient.
+        self.register_buffer("target_std", torch.ones(cfg.n_wearable_features))
+
         self.apply(self._init_weights)
 
     @staticmethod
@@ -300,7 +319,14 @@ class PhoneFMPretrainV3(nn.Module):
     ) -> torch.Tensor:
         h = self.tok_emb(input_ids) + self.type_emb(token_types)
 
-        wearable_mask = (token_types == TYPE_WEARABLE).unsqueeze(-1)
+        # CRITICAL: wearable mix-in must EXCLUDE masked positions, otherwise the
+        # MASK_ID token embedding is overwritten by wearable_proj(zero) and the
+        # model has no way to distinguish "predict here" from a regular wearable
+        # day whose features happen to be zero. The pretrain task collapses to
+        # noise without this exclusion.
+        wearable_mask = (
+            (token_types == TYPE_WEARABLE) & (input_ids != MASK_ID)
+        ).unsqueeze(-1)
         B, L, F_ = wearable_feats.shape
         wearable_norm = self.wearable_input_norm(
             wearable_feats.reshape(B * L, F_)
@@ -334,6 +360,23 @@ def main() -> None:
                                batch_size=HP["batch_size"], shuffle=True, num_workers=4)
     val_loader = make_loader(str(DATA_DIR / "val_*.parquet"),
                              batch_size=HP["batch_size"], shuffle=False, num_workers=2)
+
+    # Pre-flight: compute per-feature target std from a few batches.
+    # Used in the loss to standardize across features with wildly different
+    # scales (steps ~10k vs sleep_onset ~22).
+    print("computing target std for loss standardization...", flush=True)
+    feats_for_std = []
+    with torch.no_grad():
+        for i, batch in enumerate(train_loader):
+            tgt = batch["wearable_target"]
+            mask = batch["mask_indicator"]
+            feats_for_std.append(tgt[mask].cpu())   # (n_masked_in_batch, F)
+            if i >= 9:  # 10 batches is plenty
+                break
+    all_feats = torch.cat(feats_for_std, dim=0)     # (N, F)
+    std = all_feats.float().std(dim=0).clamp(min=1.0)
+    model.target_std.copy_(std.to(model.target_std.device))
+    print(f"target_std per feature: {[round(s, 2) for s in std.tolist()]}", flush=True)
 
     # AdamW with no-decay on bias/LayerNorm/BN
     decay, no_decay = [], []
@@ -374,7 +417,9 @@ def main() -> None:
             )
             tgt = batch["wearable_target"].to(DEVICE)
             mask_b = batch["mask_indicator"].to(DEVICE).bool()
-            diff_sq = ((pred - tgt) ** 2)[mask_b]   # (n_masked, F)
+            std = model.target_std
+            diff_std = (pred - tgt) / std
+            diff_sq = (diff_std ** 2)[mask_b]       # (n_masked, F) in z-score space
             total_sq += diff_sq.sum().item()
             total_n += diff_sq.numel()              # = n_masked × F
         model.train()
@@ -401,13 +446,14 @@ def main() -> None:
                 tgt = batch["wearable_target"].to(DEVICE)
                 mask_b = batch["mask_indicator"].to(DEVICE).bool()  # (B, L)
                 # MSE per scalar prediction (mean over both masked positions AND
-                # the n_wearable_features dim). Smoke test caught a bug where
-                # the previous formula divided by n_masked_positions instead of
-                # n_masked_positions × n_features → loss was n_features=11× too
-                # large per scalar, fine for ranking but mis-calibrated loss scale.
-                diff_sq_masked = ((pred - tgt) ** 2)[mask_b]   # (n_masked, F)
+                # the n_wearable_features dim), with per-feature standardization.
+                # Without dividing by target_std, the steps feature (range 0-100k)
+                # dominates the loss and the model never learns sleep/HR features.
+                std = model.target_std                              # (F,)
+                diff_std = (pred - tgt) / std                       # (B, L, F) in z-score space
+                diff_sq_masked = (diff_std ** 2)[mask_b]            # (n_masked, F)
                 loss = (diff_sq_masked.mean() if mask_b.any()
-                        else torch.zeros((), device=pred.device, dtype=pred.dtype))
+                        else (pred * 0.0).sum())                    # graph-safe zero
                 loss = loss / HP["grad_accum"]
 
             loss.backward()
@@ -428,9 +474,21 @@ def main() -> None:
         print(f"=== epoch {epoch}: val_masked_MSE={val_mse:.6f} ===", flush=True)
         metrics_log.append({"epoch": epoch, "step": step, "val_masked_MSE": val_mse})
 
+        # Write metrics FIRST so a crash during the save block doesn't lose this epoch's number
+        with open(OUT_DIR / "metrics.json", "w") as f:
+            json.dump(metrics_log, f, indent=2)
+
+        # Always save a resume-safe checkpoint (CLAUDE.md: mandatory for jobs >6h)
+        torch.save({
+            "model": model.state_dict(),
+            "opt": opt.state_dict(),
+            "epoch": epoch,
+            "step": step,
+            "val_mse": val_mse,
+        }, OUT_DIR / "last.pt")
+
         if val_mse < best_val:
             best_val = val_mse
-            # Save full state for resume + backbone-only for fine-tune init
             torch.save(model.state_dict(), OUT_DIR / "best.pt")
             backbone_state = {
                 k: v for k, v in model.state_dict().items()
@@ -440,9 +498,6 @@ def main() -> None:
             with open(OUT_DIR / "config.json", "w") as f:
                 json.dump({"config": cfg.__dict__, "hp": HP, "val_mse": val_mse}, f, indent=2)
             print(f"  saved best.pt + backbone_only.pt  (val_mse={best_val:.6f})", flush=True)
-
-        with open(OUT_DIR / "metrics.json", "w") as f:
-            json.dump(metrics_log, f, indent=2)
 
     print("pretraining complete", flush=True)
 
