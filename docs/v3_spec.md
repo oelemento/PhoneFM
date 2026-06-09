@@ -1,9 +1,13 @@
 # PhoneFM v3 — Multi-Domain, Multi-Horizon Risk Foundation Model
 
-**Status:** draft
+**Status:** draft (v0.2 — OSA dropped per empirical check)
 **Author:** Olivier Elemento (with Claude)
 **Date:** 2026-06-09
 **Builds on:** v2 (commit `c62a31b` on `v2-dev`), val AFib AUROC 0.9229 after epoch 0
+
+**Changelog:**
+- v0.2 (2026-06-09): drop OSA as a primary outcome (AoU prevalence 2.5% vs. true ~25% → detection bias dominates); move OSA to baseline confounder. Document empirical OSA prevalence query results. Address Critical feasibility-reviewer findings on cohort size empirical check, SNOMED descendant traversal, and multi-source phenotyping.
+- v0.1 (2026-06-09): initial draft with 5 domains × 3 horizons.
 
 ---
 
@@ -21,24 +25,45 @@ The v3 design lifts these three constraints without redesigning the backbone.
 
 ## 2. Endpoint panel
 
-Five domains × three horizons = 15 (endpoint, horizon) prediction heads.
+Four primary domains × multiple horizons = **11 active heads**.
 
-| Domain | Endpoint | ICD-10 / source | Baseline exclusion | Horizons |
+| Domain | Endpoint | Phenotype source | Baseline mask | Horizons |
 |---|---|---|---|---|
-| Mortality | All-cause death | `death` table | None | 30d, 180d, 365d |
-| Metabolic | T2D incident | E11.\* | E10/E11 ever before window | 180d, 365d |
-| Mental health | Major depression incident | F32.\*, F33.\* | F32/F33 ever before window | 180d, 365d |
-| Cardiovascular | Composite (AFib + MI + HF) | I48.\*, I21–I22, I50.\* | None (kept for continuity with v2) | 30d, 180d, 365d |
-| Sleep | OSA incident | G47.33 | G47.33 ever before | 365d only |
+| Mortality | All-cause death | `death` table (any death) | None | 30d, 180d, 365d |
+| Metabolic | T2D first-recorded | Multi-source (ICD E11 + A1c ≥ 6.5 + RxNorm anti-diabetic) | Same multi-source ever before | 180d, 365d |
+| Mental health | Depression first-recorded | Multi-source (ICD F32/F33 + antidepressant RxNorm) | Same multi-source ever before | 180d, 365d |
+| Cardiovascular | Composite (AFib + MI + HF) | SNOMED descendant traversal (concept_ancestor) of root concepts | None (continuity with v2) | 30d, 180d, 365d |
 
-**Total heads:** 4 + 2 + 2 + 3 + 1 = **12 active heads** (cv_death dropped per v2; we may add back if mortality covers it).
+**Total active heads:** 3 + 2 + 2 + 3 = **10 heads with backprop** (cv_death dropped; OSA dropped — see §2.1).
 
-**Why these five:**
-- **Mortality:** zero-cost extension (death table already pulled); gold-standard endpoint that reviewers respect; gives the paper a survival-analysis story.
-- **T2D incident:** Master 2022 *Nat Med* established daily steps → T2D in AoU. Direct precedent. Multi-task model that matches Master plus delivers AFib lets you cite both works as baselines you beat.
-- **Depression incident:** lifetime prevalence ~17%, strong sleep-architecture signal, opens "mental health from phone" as a clinical story. High novelty for cardiovascular reviewers.
-- **CV composite:** keeps continuity with v2 and v1 results, allows narrative "we extend the cardio model to broader risk."
-- **OSA:** direct fit with the sleep stage features. Lower priority — drop if cohort size is insufficient after baseline exclusion.
+**Why these four (post-OSA drop):**
+- **Mortality:** zero-cost extension (death table already pulled); gold-standard endpoint reviewers respect; gives the paper a survival-analysis story.
+- **T2D first-recorded:** Master 2022 *Nat Med* established daily steps → T2D in AoU. Direct precedent. Renamed from "incident" to "first-recorded" to be honest about AoU's right-truncation; multi-source phenotype matches eMERGE/PheKB standard.
+- **Depression first-recorded:** lifetime prevalence ~17%, strong sleep-architecture signal, opens "mental health from phone" as a clinical story. Antidepressant evidence captures undertreated cases.
+- **CV composite:** keeps continuity with v2 and v1 results, allows narrative "we extend the cardio model to broader risk." SNOMED descendant traversal restored to fix v2's source-concept-only undercount.
+
+### 2.1 OSA: dropped as primary outcome, added as confounder
+
+**Empirical query (2026-06-09 against `wb-silky-artichoke-2408.C2024Q3R8`):**
+
+| Cohort | OSA diagnosed (G47.33 + SNOMED) | N | Rate |
+|---|---|---|---|
+| AoU Controlled Tier (whole CDR) | 16,082 | 633,547 | **2.54%** |
+| PhoneFM cohort (first 5,000 pids) | 219 | 5,000 | **4.38%** |
+
+True adult OSA prevalence per polysomnography studies is **~25–30%**. AoU's recorded prevalence is **~10%** of the true rate, consistent with the ~80–90% undiagnosed figure in the OSA literature. PhoneFM cohort enrichment (1.7× over CDR) reflects that Fitbit wearers skew healthcare-engaged, not that they have more disease.
+
+**Decision:** Drop OSA from `head_names`. A "baseline-OSA-excluded → predict incident OSA in 365d" head would actually train the model to predict **who gets referred for and completes a sleep study**, not who has the disease. Detection bias would dominate the wearable signal because:
+1. Undiagnosed OSA at baseline is silently 80% of the cohort.
+2. Wearable signal (sleep fragmentation, HR variability) carries actual OSA information, *not* future-referral information.
+3. The model would learn to predict referral, which is a healthcare-access proxy rather than a clinical outcome.
+
+**Instead, OSA becomes a confounder:**
+- Add `baseline_osa` (G47.33 + SNOMED descendants ever before window) to the 8-dim confounder vector (`precompute_confounders`).
+- The confounder vector grows from 8 → 9 dims, requiring `PhoneFMV3Config.n_confounders = 9`.
+- This stops the wearable signal from fighting against existing OSA in the other heads.
+
+**Future option (not in v3):** if/when we have a polysomnography-confirmed subcohort, reframe OSA as "positive sleep study within 365d" using CPT 95810/95811 from `procedure_occurrence`. The model would predict who *should be* referred — a more clinically actionable phone-driven endpoint that avoids the detection-bias trap.
 
 ---
 
@@ -68,20 +93,36 @@ For mortality and CV composite there is no mask (always 1).
 
 ## 5. Data extraction additions
 
-### 5.1 `endpoint_concept_ids.json` expansion
+### 5.1 `endpoint_concept_ids.json` expansion (with SNOMED descendant traversal)
 
-New keys needed (ICD-10 source concept IDs, same format as existing afib/mi/hf):
+v2 used ICD-10 prefix matching (e.g., `LIKE 'E11%'`) on `condition_source_concept_id`. That works for AFib (AoU sites mostly submit ICD), but undercounts T2D and depression by 20–40% at SNOMED-shop sites (e.g., academic medical centers feeding AoU via Epic with SNOMED Reference Sets).
 
-- `t2d_incident`: ICD-10 E11.\* family
-- `t2d_baseline_exclusion`: E10.\* + E11.\* (any diabetes)
-- `dep_incident`: F32.\* + F33.\*
-- `dep_baseline_exclusion`: F32.\* + F33.\* + F34.1 (dysthymia)
-- `osa_incident`: G47.33 only
-- `osa_baseline_exclusion`: G47.33
+**Correct approach** uses `concept_ancestor` to traverse from a SNOMED root through all descendants, then unions with ICD-10 leaf codes:
 
-(BQ lookup: `SELECT concept_id, concept_name FROM concept WHERE vocabulary_id='ICD10CM' AND concept_code LIKE 'E11%'` then write JSON.)
+```sql
+-- T2D: SNOMED root 201826 (Type 2 diabetes mellitus) + ICD10CM E11.*
+SELECT DISTINCT ca.descendant_concept_id AS cid
+FROM `{CDR}.concept_ancestor` ca
+JOIN `{CDR}.concept` c ON ca.ancestor_concept_id = c.concept_id
+WHERE c.concept_id = 201826
+   OR (c.vocabulary_id = 'ICD10CM' AND c.concept_code LIKE 'E11%')
+```
 
-**Effort:** ~1 hour. New file: `data_prep/build_endpoint_concept_ids.py`.
+Apply this pattern for all five primary endpoints + their baseline-exclusion variants. The label query then filters on `condition_concept_id IN UNNEST(...)` (the standard concept), not `condition_source_concept_id`. v2 used `_source_` because AFib is overwhelmingly ICD-coded; that choice ports poorly to T2D / depression and is corrected in v3.
+
+**Codeset definitions (multi-source phenotype):**
+
+| Endpoint | Diagnosis evidence | Lab evidence (`measurement`) | Drug evidence (`drug_exposure`) |
+|---|---|---|---|
+| `mortality` | `death.death_date IS NOT NULL` | – | – |
+| `t2d_first` | E11.\* + SNOMED 201826 descendants (≥2 occurrences, ≥30 d apart) | HbA1c (LOINC 4548-4) ≥ 6.5% **OR** fasting glucose (LOINC 1558-6) ≥ 126 **OR** random glucose ≥ 200 | RxNorm class "Antidiabetic Agents" via `concept_ancestor` from 21600712 |
+| `dep_first` | F32.\* + F33.\* + SNOMED 192080 descendants (≥1 occurrence) | PHQ-9 ≥ 10 (if available in `observation`) | RxNorm class "Antidepressants" via `concept_ancestor` from 21604686 |
+| `cv_composite` | AFib (SNOMED 313217) + MI (SNOMED 4329847) + HF (SNOMED 316139) descendants | – (kept binary for v2 continuity) | – |
+| `baseline_osa` (confounder) | G47.33 + SNOMED 4154290 descendants | – | – |
+
+**Phenotype rule:** A subject is **first-recorded** at the earliest date of *any* of the three evidence types (Dx, Lab, Drug). Baseline-exclusion uses the same multi-source rule on the lookback period.
+
+**Effort:** ~4 hours (was 1 hour). New file: `data_prep/build_endpoint_concept_ids.py` writes JSON with separate code lists per evidence type per endpoint. Includes a self-test that counts hits per endpoint per evidence source on the full cohort and warns if any source contributes <5%.
 
 ### 5.2 Tokenizer changes (`02_tokenizer_v3.py`)
 
