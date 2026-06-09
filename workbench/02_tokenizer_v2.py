@@ -233,6 +233,10 @@ def fetch_sleep_daily(pids: list[int]) -> pd.DataFrame:
     sleep_date DATE. NO sleep_start_datetime — onset is derived from
     `sleep_level` (MIN(start_datetime) per person/date where is_main_sleep='true').
     """
+    # NOTE: minute_asleep in AoU's sleep_daily_summary is broken for many
+    # users (smoke test 2026-06-09: ≈1 min for some records while stage
+    # minutes rem+deep+light totaled ~7h). Use stage sum as total — robust
+    # against the bad field and tighter to actual sleep architecture.
     sql = f"""
     WITH onset AS (
       SELECT person_id, sleep_date,
@@ -244,28 +248,31 @@ def fetch_sleep_daily(pids: list[int]) -> pd.DataFrame:
     ),
     daily AS (
       SELECT s.person_id, s.sleep_date,
-             MAX(s.minute_asleep) AS minute_asleep,
              MAX(s.minute_rem)    AS minute_rem,
              MAX(s.minute_deep)   AS minute_deep,
              MAX(s.minute_light)  AS minute_light
       FROM `{CDR}.sleep_daily_summary` s
       WHERE s.person_id IN UNNEST({pids})
         AND s.is_main_sleep = 'true'
-        AND s.minute_asleep IS NOT NULL
-        AND s.minute_asleep > 0
       GROUP BY s.person_id, s.sleep_date
     )
     SELECT d.person_id,
            d.sleep_date AS d,
-           d.minute_asleep / 60.0                                  AS sleep_duration_hr,
-           SAFE_DIVIDE(d.minute_rem,   d.minute_asleep)             AS rem_pct,
-           SAFE_DIVIDE(d.minute_deep,  d.minute_asleep)             AS deep_pct,
-           SAFE_DIVIDE(d.minute_light, d.minute_asleep)             AS light_pct,
+           (COALESCE(d.minute_rem,0) + COALESCE(d.minute_deep,0)
+              + COALESCE(d.minute_light,0)) / 60.0                AS sleep_duration_hr,
+           SAFE_DIVIDE(d.minute_rem,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0))   AS rem_pct,
+           SAFE_DIVIDE(d.minute_deep,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0))   AS deep_pct,
+           SAFE_DIVIDE(d.minute_light,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0))   AS light_pct,
            EXTRACT(HOUR   FROM o.first_start) +
              EXTRACT(MINUTE FROM o.first_start) / 60.0             AS sleep_onset_hour
     FROM daily d
     LEFT JOIN onset o
            ON o.person_id = d.person_id AND o.sleep_date = d.sleep_date
+    WHERE COALESCE(d.minute_rem,0) + COALESCE(d.minute_deep,0)
+            + COALESCE(d.minute_light,0) > 60   -- ≥1h of staged sleep
     """
     df = _bq_to_df(sql)
     df["d"] = pd.to_datetime(df["d"]).dt.normalize()
