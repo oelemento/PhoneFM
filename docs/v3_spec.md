@@ -6,6 +6,7 @@
 **Builds on:** v2 (commit `c62a31b` on `v2-dev`), val AFib AUROC 0.9229 after epoch 0
 
 **Changelog:**
+- v0.3 (2026-06-09): adopt four enhancements per strategy review — self-supervised pre-training (stub committed at `workbench/04_pretrain_v3.py`), negative-control endpoints, discrete-time hazard framing, pre-registered subgroup analyses. PRS integration and iPhone deployment moved to future-work section.
 - v0.2 (2026-06-09): drop OSA as a primary outcome (AoU prevalence 2.5% vs. true ~25% → detection bias dominates); move OSA to baseline confounder. Document empirical OSA prevalence query results. Address Critical feasibility-reviewer findings on cohort size empirical check, SNOMED descendant traversal, and multi-source phenotyping.
 - v0.1 (2026-06-09): initial draft with 5 domains × 3 horizons.
 
@@ -34,7 +35,7 @@ Four primary domains × multiple horizons = **11 active heads**.
 | Mental health | Depression first-recorded | Multi-source (ICD F32/F33 + antidepressant RxNorm) | Same multi-source ever before | 180d, 365d |
 | Cardiovascular | Composite (AFib + MI + HF) | SNOMED descendant traversal (concept_ancestor) of root concepts | None (continuity with v2) | 30d, 180d, 365d |
 
-**Total active heads:** 3 + 2 + 2 + 3 = **10 heads with backprop** (cv_death dropped; OSA dropped — see §2.1).
+**Total active heads:** 3 + 2 + 2 + 3 = **10 supervised heads with backprop** (cv_death dropped; OSA dropped — see §2.1) **+ 3 negative-control heads** (see §11.2) = **13 total heads at training time**.
 
 **Why these four (post-OSA drop):**
 - **Mortality:** zero-cost extension (death table already pulled); gold-standard endpoint reviewers respect; gives the paper a survival-analysis story.
@@ -198,16 +199,20 @@ Comparisons to clinical scores:
 
 ---
 
-## 9. Estimated timeline & cost
+## 9. Estimated timeline & cost (v0.3, with enhancements)
 
 | Step | Time | A100 cost |
 |---|---|---|
-| Build `endpoint_concept_ids.json` (BQ + JSON) | 0.5 day | $0 |
-| Fork tokenizer/dataset/model/train to v3 | 1 day | $0 |
-| Re-tokenize on n1-highmem-2 (longer cohort = more chunks) | 3-4h | $0.50 |
-| Train 10 epochs on A100 | ~3.5h | ~$13 |
-| Generate val/test metrics + subgroup analyses | 0.5 day | $0 |
+| Build `endpoint_concept_ids.json` (BQ + JSON, multi-source phenotypes) | 0.5 day | $0 |
+| Build `subgroup_definitions.json` (pre-registration) | 0.25 day | $0 |
+| Fork tokenizer/dataset/model/train to v3 (incl. negative-control heads) | 1 day | $0 |
+| Re-tokenize on n1-highmem-2 (longer cohort, new endpoint codesets) | 3-4h | $0.50 |
+| **Pre-train backbone on wearable history (§11.1)** | **~1.5h** | **~$5** |
+| Fine-tune 13-head supervised model from pretrained backbone (fewer epochs needed) | ~2h | ~$8 |
+| Generate val/test metrics + subgroup analyses (§11.4) + DCA + Cox sensitivity (§11.3) | 0.5 day | $0 |
 | **Total** | **~3 days work + ~$14 compute** | |
+
+Pretraining + faster fine-tune nets out to roughly the same total cost as the v0.1 plan but delivers the transferable backbone + foundation-model framing as bonus.
 
 ---
 
@@ -220,10 +225,119 @@ Comparisons to clinical scores:
 
 ---
 
-## 11. Decision points before commit
+## 11. Enhancements adopted (in scope for v3)
 
-- [ ] Pick the final endpoint list (this draft proposes 5 domains)
-- [ ] Confirm max horizon (365d or 180d)
+Four strategy-review additions accepted into v3 scope; near-zero engineering cost on top of the §2–9 plan but materially strengthens the publication story.
+
+### 11.1 Self-supervised pre-training
+
+**Pretext task:** masked daily-vector reconstruction on 90-day wearable subwindows. 15% of valid daily-vector positions are zeroed and their `input_ids` replaced with `MASK_ID=4`; a regression head predicts the missing 11-dim vectors via MSE loss.
+
+**Status:** stub committed at `workbench/04_pretrain_v3.py` on branch `v3-spec`. Smoke test at `workbench/04_pretrain_v3_smoke.py` verifies masked-MSE math, shape contracts, and gradient flow on synthetic shards.
+
+**Backbone reuse:** `PhoneFMPretrainV3` uses identical layer names as `PhoneFMV2`, so the post-pretrain `backbone_only.pt` (without the `pretrain_head.*` keys) loads into the v3 supervised model via `state_dict(strict=False)`. Supervised heads initialize randomly on top of pretrained backbone.
+
+**Why pretrain:**
+- Backbone learns wearable distribution structure (circadian rhythm, sleep cycles, illness perturbations) from unlabeled data before being asked to predict labels.
+- Strengthens "foundation model" framing — reviewer-recognized SSL → fine-tune pattern from BERT/GPT/ChronosFM.
+- Fine-tuning converges faster than from-scratch (typically 1/3 the steps), so total pipeline cost is roughly neutral.
+- Reusable backbone for v3.1, v4, and any future PhoneFM project — pays back across the program, not just this paper.
+
+**Budget:** 1-2h on A100 for ~100K-200K steps, ~$4-6.
+
+### 11.2 Negative control endpoints
+
+Add three heads for conditions that *should not* be predictable from wearable signal. Same multi-source phenotype machinery as the primary endpoints, but the prior on AUROC is 0.5.
+
+| Negative control | ICD-10 / SNOMED | Why this is "negative" |
+|---|---|---|
+| Skin malignant neoplasm | C43.\* + C44.\* + SNOMED 4112752 descendants | Skin cancer onset is not driven by wearable-detectable physiology. |
+| Refractive errors of the eye | H52.\* + SNOMED 4218554 descendants | Vision changes are uncorrelated with HR/sleep/activity. |
+| Dental caries | K02.\* + SNOMED 4210708 descendants | Oral health depends on diet and hygiene, not movement or HR. |
+
+**Why this matters:** if the model predicts skin cancer at AUROC 0.7+, the wearable signal is functioning as a *healthcare-engagement proxy* (people who get diagnosed are people who see doctors, who tend to be Fitbit-wearing/EHR-engaged), not as actual disease information. Reviewers will ask this in any AoU paper. Pre-built negative controls preempt the critique.
+
+**Expected outcome:** AUROC ≈ 0.5 ± 0.03 (95% CI) on each negative control, demonstrating the wearable signal carries real cardiovascular/metabolic/sleep information rather than utilization confounding.
+
+**Implementation:** add three more entries to `endpoint_concept_ids.json`; three more `Linear(d_model, 1)` heads; loss participates in backprop at the same head_weight as primary endpoints (to test for spurious predictability). Zero new training time.
+
+### 11.3 Discrete-time hazard framing
+
+Frame the multi-horizon BCE structure as a **discrete-time survival model** rather than "binary classification at multiple horizons." For each (endpoint, horizon h), the head predicts:
+
+$$\hat{\lambda}_{ep,h}(x) = P(\text{event occurs in horizon } h \mid \text{survived to end\_date}, x)$$
+
+i.e., a discrete hazard. The right-censoring mask in §4 already implements the survival-analysis cohort logic correctly: `mask=0` for participants whose follow-up doesn't reach the horizon. Under independent censoring, this is the **Brown 1975 / Kvamme & Borgan 2019** discrete-time equivalent of a Cox proportional-hazards model and inherits its statistical properties.
+
+**Why this matters:** "multi-horizon BCE classifier" sounds ad-hoc to clinical-statistics reviewers; "discrete-time hazard model with right-censoring" is a recognized survival framework with decades of theory behind it. Same math, different framing, much better paper.
+
+**Implementation:** zero code change. One paragraph in the methods section + one pre-registered sensitivity analysis:
+- Refit each `(endpoint, 365d)` head as a Cox PH model on the test set features, compare C-index to the discrete-time AUROC.
+- If they agree within 0.01, the discrete-time choice is vindicated and the paper claims discrete-time hazard modeling as a methodological contribution.
+
+### 11.4 Pre-registered subgroup analyses
+
+AoU's demographic diversity is the strongest scientific asset most wearable papers fail to leverage. v3 pre-registers the following analyses *before* training starts so the paper cannot be accused of p-hacking subgroups post hoc.
+
+**Marginal subgroups** (computed independently on test set):
+- Race / ethnicity: Black, Hispanic/Latino, Asian, White, Other
+- Age at end_date: <55, 55–65, >65
+- Sex at birth: Male, Female
+- SES proxy (AoU income quartile when available)
+
+**One pairwise interaction** (highest policy relevance, lowest multiple-testing burden):
+- Race × age stratum
+
+**Per-subgroup metrics:**
+- AUROC, AUPRC with bootstrap 95% CI (1,000 resamples)
+- Brier calibration score
+- Net benefit at clinical decision thresholds (DCA — see §8)
+
+**Pre-registration mechanism:** the subgroup definition file `data_prep/subgroup_definitions.json` is committed BEFORE the test set is touched. Diff against this file is checked in the eval script. Required for *Nature Medicine* methodological rigor.
+
+**Implementation:** one new eval script `06_subgroup_analysis.py`. Runs on the saved `best.pt` after training completes — separate from training loop, no impact on training time.
+
+---
+
+## 12. Future work (post-v3)
+
+Two enhancements reviewed and deferred to v3.1+ to keep v3 scope tractable.
+
+### 12.1 Polygenic risk score integration
+
+AoU has whole-genome data for ~250K participants, with overlap into the PhoneFM cohort. Published-and-validated PRS exist for AFib, T2D, depression, and CAD (PGS Catalog IDs PGS000727, PGS000014, PGS000731, PGS000018, etc.).
+
+**Plan:** add PRS as additional confounder dims (n_confounders 9 → 13+). Two analyses become possible:
+- Show wearable signal adds AUROC *beyond* genetic risk (the strong reviewer ask)
+- Mendelian-randomization-style causal analysis on T2D and depression using AoU genetics — could elevate v3.1 from prediction to causal inference
+
+Cost: ~3 days work + zero new compute (PRS are precomputed). Target: v3.1.
+
+### 12.2 iPhone deployment with Core ML
+
+Convert `best.pt` to Core ML format. Benchmark on iPhone hardware:
+- Inference latency (target <100ms on A17)
+- Memory footprint (target <50MB)
+- Battery drain over 24h of continuous prediction
+
+Two days of swift + CoreML work, but this is the **differentiator** that separates this from every other academic wearable foundation model paper. No big-tech academic group is publishing actual on-device deployment numbers.
+
+Target: write-up phase, after v3 trains and validates.
+
+### 12.3 External validation cohorts
+
+- **UK Biobank wrist accelerometer** subset (~100K) for EHR-conditional path only (UKB uses Axivity AX3, not Fitbit, so wearable features don't transfer)
+- **Sage Bionetworks Fitbit cohort** (My Data Helps) for true Fitbit external validation if data access can be arranged
+
+Both are post-v3 paper-prep work.
+
+---
+
+## 13. Decision points before commit
+
+- [ ] Pick the final endpoint list (this draft proposes 4 primary domains + 3 negative controls = 13 heads)
+- [ ] Confirm max horizon (365d or 180d) — empirical cohort-size check still pending
 - [ ] Confirm baseline-exclusion strategy (per-endpoint mask vs. cohort drop)
-- [ ] Pick best_metric formula for `best.pt` selection
+- [ ] Pick best_metric formula for `best.pt` selection (proposed: sum of primary-endpoint AUROCs)
 - [ ] Decide whether to run v3 immediately or first validate v2 on test set
+- [ ] Confirm subgroup definitions JSON before any test-set evaluation
