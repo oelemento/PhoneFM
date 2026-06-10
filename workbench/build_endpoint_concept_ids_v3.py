@@ -77,7 +77,11 @@ ENDPOINT_DEFS: dict[str, dict[str, Any]] = {
     },
     "dep": {
         "dx": {
-            "snomed_roots": [192080],          # Depressive disorder
+            # 440383 = Depressive disorder (SNOMED, standard)
+            # 4152280 = Major depressive disorder (SNOMED, standard)
+            # Original guess 192080 was not a standard SNOMED ancestor → 0 hits;
+            # these two roots together cover 112,614 persons in the CDR.
+            "snomed_roots": [440383, 4152280],
             "icd10_prefixes": ["F32", "F33"],
         },
         "drug": {
@@ -107,13 +111,19 @@ ENDPOINT_DEFS: dict[str, dict[str, Any]] = {
     },
     "refractive_errors": {
         "dx": {
-            "snomed_roots": [4218554],         # Refractive disorder
+            # 4191597 = Disorder of refraction; 377861 = Disorder of refraction
+            # AND/OR accommodation; 4182553 = Disorder of accommodation.
+            # Original guess 4218554 did not exist as a SNOMED ancestor → 0 hits;
+            # these three together cover 57,555 persons via 109 descendants.
+            "snomed_roots": [4191597, 377861, 4182553],
             "icd10_prefixes": ["H52"],
         },
     },
     "dental_caries": {
         "dx": {
-            "snomed_roots": [4210708],         # Dental caries
+            # 133228 = Dental caries (SNOMED, standard). Original guess 4210708
+            # did not match. 133228 covers 18,590 persons via 102 descendants.
+            "snomed_roots": [133228],
             "icd10_prefixes": ["K02"],
         },
     },
