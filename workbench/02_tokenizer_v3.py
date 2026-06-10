@@ -616,7 +616,10 @@ def precompute_subgroup_metadata() -> None:
     # AoU often suppresses month/day on birth_datetime for rare birthdates and
     # leaves YYYY-01-01 as the default. We keep the value as-is; encode_window_v3
     # falls back to year-difference if the date arithmetic is suspicious.
-    df["birth_date"] = pd.to_datetime(df["birth_datetime"], errors="coerce").dt.normalize()
+    # AoU stores birth_datetime as TIMESTAMP (tz-aware UTC); strip tz so it can
+    # be subtracted from `end_date` (tz-naive, derived from fb_start.normalize()).
+    bd_series = pd.to_datetime(df["birth_datetime"], errors="coerce", utc=True)
+    df["birth_date"] = bd_series.dt.tz_convert(None).dt.normalize()
     df = df.drop(columns=["birth_datetime"])
     df.to_parquet(cache, compression="snappy")
     for r in df.itertuples(index=False):
@@ -779,6 +782,10 @@ def encode_window_v3(
     # privacy on rare birth dates).
     birth_date = _BIRTH_DATE_CACHE.get(pid)
     if birth_date is not None:
+        # Strip tz defensively — birth_date from cache may be tz-aware while
+        # end_date is tz-naive; pandas refuses to subtract across tz states.
+        if getattr(birth_date, "tz", None) is not None:
+            birth_date = birth_date.tz_convert(None)
         age_years = int((end_date - birth_date).days // 365)
     else:
         age_years = int(end_date.year - (fb_start.year - int(confounders[0])))
