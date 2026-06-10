@@ -150,16 +150,31 @@ def _bq_in_list(ids: list[int]) -> str:
     return "(" + ",".join(str(int(x)) for x in ids) + ")"
 
 
-# ---- Wearable fetchers — verbatim copy of v2 signatures (BQ schema unchanged)
+# ---- Wearable + EHR fetchers — PORTED VERBATIM from v2 (working against AoU CDR v8).
+# Initial v3 draft of these used wrong column names + a BOOL comparison against
+# the STRING `is_main_sleep` column and joined on raw source_value, all of which
+# crashed against the live CDR. v2's queries were verified during v2 tokenization,
+# so v3 reuses them exactly.
 
 def fetch_steps_daily(pids: list[int]) -> pd.DataFrame:
+    """Aggregate steps_intraday into daily totals.
+
+    AoU CDR v8 has NO `activity_summary` table — only `steps_intraday`. Sum
+    across the day. Inner CTE dedupes over `src_id` to avoid double-counting
+    when one minute has multiple source rows.
+    """
     sql = f"""
-    SELECT person_id,
-           DATE(datetime) AS d,
-           SUM(steps) AS steps
-    FROM `{CDR}.steps_intraday`
-    WHERE person_id IN UNNEST({pids})
-    GROUP BY person_id, d
+    WITH per_minute AS (
+      SELECT person_id, datetime,
+             MAX(CAST(steps AS INT64)) AS steps
+      FROM `{CDR}.steps_intraday`
+      WHERE person_id IN UNNEST({pids})
+        AND steps IS NOT NULL
+      GROUP BY person_id, datetime
+    )
+    SELECT person_id, DATE(datetime) AS d, SUM(steps) AS steps
+    FROM per_minute
+    GROUP BY person_id, DATE(datetime)
     """
     df = _bq_to_df(sql)
     df["d"] = pd.to_datetime(df["d"]).dt.normalize()
@@ -167,22 +182,28 @@ def fetch_steps_daily(pids: list[int]) -> pd.DataFrame:
 
 
 def fetch_hr_daily(pids: list[int]) -> pd.DataFrame:
+    """Aggregate minute-HR into daily mean/resting/max + SDANN proxy.
+
+    `heart_rate_minute_level` column is DATETIME, so use DATETIME_TRUNC
+    (not TIMESTAMP_TRUNC).
+    """
     sql = f"""
-    WITH per_5min AS (
+    WITH min1 AS (
       SELECT person_id,
-             DATETIME_TRUNC(datetime, MINUTE) AS dt,
-             AVG(heart_rate_value) AS hr5
+             DATETIME_TRUNC(datetime, MINUTE) AS m,
+             AVG(heart_rate_value) AS hr
       FROM `{CDR}.heart_rate_minute_level`
       WHERE person_id IN UNNEST({pids})
-      GROUP BY person_id, dt
+        AND heart_rate_value IS NOT NULL
+      GROUP BY person_id, m
     )
     SELECT person_id,
-           DATE(dt) AS d,
-           AVG(hr5) AS mean_hr,
-           APPROX_QUANTILES(hr5, 100)[OFFSET(10)] AS resting_hr,
-           APPROX_QUANTILES(hr5, 100)[OFFSET(95)] AS max_hr,
-           STDDEV(hr5) AS sdann
-    FROM per_5min
+           DATE(m) AS d,
+           AVG(hr) AS mean_hr,
+           APPROX_QUANTILES(hr, 100)[OFFSET(10)] AS resting_hr,
+           APPROX_QUANTILES(hr, 100)[OFFSET(95)] AS max_hr,
+           STDDEV(hr) AS sdann
+    FROM min1
     GROUP BY person_id, d
     """
     df = _bq_to_df(sql)
@@ -191,21 +212,52 @@ def fetch_hr_daily(pids: list[int]) -> pd.DataFrame:
 
 
 def fetch_sleep_daily(pids: list[int]) -> pd.DataFrame:
+    """Daily sleep summary: total sleep + REM/deep/light pct + onset hour.
+
+    AoU CDR v8 `sleep_daily_summary` columns (verified): minute_asleep,
+    minute_rem, minute_deep, minute_light, ..., is_main_sleep STRING,
+    sleep_date DATE. NO sleep_start_datetime — onset is derived from
+    `sleep_level` (MIN(start_datetime) per person/date where is_main_sleep='true').
+
+    minute_asleep is broken for many users (≈1 min while stage minutes sum to
+    ~7h); use stage sum as total.
+    """
     sql = f"""
-    SELECT s.person_id,
-           DATE(s.sleep_date) AS d,
-           SAFE_DIVIDE(SUM(s.minute_in_rem) + SUM(s.minute_in_deep) + SUM(s.minute_in_light), 60.0) AS sleep_duration_hr,
-           SAFE_DIVIDE(SUM(s.minute_in_rem),
-                       NULLIF(SUM(s.minute_in_rem) + SUM(s.minute_in_deep) + SUM(s.minute_in_light), 0)) AS rem_pct,
-           SAFE_DIVIDE(SUM(s.minute_in_deep),
-                       NULLIF(SUM(s.minute_in_rem) + SUM(s.minute_in_deep) + SUM(s.minute_in_light), 0)) AS deep_pct,
-           SAFE_DIVIDE(SUM(s.minute_in_light),
-                       NULLIF(SUM(s.minute_in_rem) + SUM(s.minute_in_deep) + SUM(s.minute_in_light), 0)) AS light_pct,
-           EXTRACT(HOUR FROM MIN(s.sleep_start_time)) AS sleep_onset_hour
-    FROM `{CDR}.sleep_daily_summary` s
-    WHERE s.person_id IN UNNEST({pids})
-      AND s.is_main_sleep = TRUE
-    GROUP BY s.person_id, d
+    WITH onset AS (
+      SELECT person_id, sleep_date,
+             MIN(start_datetime) AS first_start
+      FROM `{CDR}.sleep_level`
+      WHERE person_id IN UNNEST({pids})
+        AND is_main_sleep = 'true'
+      GROUP BY person_id, sleep_date
+    ),
+    daily AS (
+      SELECT s.person_id, s.sleep_date,
+             MAX(s.minute_rem)    AS minute_rem,
+             MAX(s.minute_deep)   AS minute_deep,
+             MAX(s.minute_light)  AS minute_light
+      FROM `{CDR}.sleep_daily_summary` s
+      WHERE s.person_id IN UNNEST({pids})
+        AND s.is_main_sleep = 'true'
+      GROUP BY s.person_id, s.sleep_date
+    )
+    SELECT d.person_id,
+           d.sleep_date AS d,
+           (COALESCE(d.minute_rem,0) + COALESCE(d.minute_deep,0)
+              + COALESCE(d.minute_light,0)) / 60.0 AS sleep_duration_hr,
+           SAFE_DIVIDE(d.minute_rem,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0)) AS rem_pct,
+           SAFE_DIVIDE(d.minute_deep,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0)) AS deep_pct,
+           SAFE_DIVIDE(d.minute_light,
+                       COALESCE(d.minute_rem,0)+COALESCE(d.minute_deep,0)+COALESCE(d.minute_light,0)) AS light_pct,
+           EXTRACT(HOUR FROM o.first_start)
+             + EXTRACT(MINUTE FROM o.first_start) / 60.0 AS sleep_onset_hour
+    FROM daily d
+    LEFT JOIN onset o
+           ON o.person_id = d.person_id AND o.sleep_date = d.sleep_date
+    WHERE COALESCE(d.minute_rem,0) + COALESCE(d.minute_deep,0)
+            + COALESCE(d.minute_light,0) > 60   -- ≥1h of staged sleep
     """
     df = _bq_to_df(sql)
     df["d"] = pd.to_datetime(df["d"]).dt.normalize()
@@ -213,60 +265,56 @@ def fetch_sleep_daily(pids: list[int]) -> pd.DataFrame:
 
 
 def fetch_ehr_events(pids: list[int]) -> pd.DataFrame:
-    """Wide pull of EHR tokens within all participants' history.
+    """All vocab-relevant EHR events with (person_id, event_date, token_id, token_type).
 
-    Replicated from v2 — the EHR token vocabulary did not change between v2/v3.
-    See 02_tokenizer_v2.py:288 for the original implementation.
+    Reuses v1's vocab.json. Map each row's source_concept_id → concept_code →
+    token_name → id. NOTE: token_name keys use the ICD-10 / RxNorm / CPT
+    concept_code from the concept table, NOT raw `*_source_value` (which is the
+    EMR's free-text value and doesn't reliably match the vocab).
     """
-    # Conditions
-    cond_sql = f"""
-    SELECT person_id,
-           condition_start_date AS d,
-           CAST(condition_source_value AS STRING) AS source_value
-    FROM `{CDR}.condition_occurrence`
-    WHERE person_id IN UNNEST({pids})
+    sql_cond = f"""
+    SELECT co.person_id, co.condition_start_date AS d,
+           c.concept_code AS code, 'DX10' AS prefix
+    FROM `{CDR}.condition_occurrence` co
+    JOIN `{CDR}.concept` c ON co.condition_source_concept_id = c.concept_id
+    WHERE co.person_id IN UNNEST({pids})
+      AND c.vocabulary_id IN ('ICD10CM', 'ICD10')
     """
-    cond = _bq_to_df(cond_sql)
-    cond["token_name"] = "DX10:" + cond["source_value"].astype(str).str.slice(0, 3)
-
-    drug_sql = f"""
-    SELECT person_id,
-           drug_exposure_start_date AS d,
-           CAST(drug_concept_id AS STRING) AS source_value
-    FROM `{CDR}.drug_exposure`
-    WHERE person_id IN UNNEST({pids})
+    sql_drug = f"""
+    SELECT de.person_id, de.drug_exposure_start_date AS d,
+           c.concept_code AS code, 'MED' AS prefix
+    FROM `{CDR}.drug_exposure` de
+    JOIN `{CDR}.concept` c ON de.drug_source_concept_id = c.concept_id
+    WHERE de.person_id IN UNNEST({pids})
     """
-    drug = _bq_to_df(drug_sql)
-    drug["token_name"] = "MED:" + drug["source_value"].astype(str)
-
-    proc_sql = f"""
-    SELECT person_id,
-           procedure_date AS d,
-           CAST(procedure_source_value AS STRING) AS source_value
-    FROM `{CDR}.procedure_occurrence`
-    WHERE person_id IN UNNEST({pids})
+    sql_proc = f"""
+    SELECT po.person_id, po.procedure_date AS d,
+           c.concept_code AS code, 'PX10' AS prefix
+    FROM `{CDR}.procedure_occurrence` po
+    JOIN `{CDR}.concept` c ON po.procedure_source_concept_id = c.concept_id
+    WHERE po.person_id IN UNNEST({pids})
+      AND c.vocabulary_id IN ('ICD10PCS', 'CPT4')
     """
-    proc = _bq_to_df(proc_sql)
-    proc["token_name"] = "PX10:" + proc["source_value"].astype(str).str.slice(0, 3)
-
-    lab_sql = f"""
-    SELECT person_id,
-           measurement_date AS d,
-           CAST(measurement_concept_id AS STRING) AS source_value
-    FROM `{CDR}.measurement`
-    WHERE person_id IN UNNEST({pids})
-      AND measurement_concept_id IS NOT NULL
+    sql_lab = f"""
+    SELECT m.person_id, m.measurement_date AS d,
+           c.concept_code AS code, 'LAB' AS prefix
+    FROM `{CDR}.measurement` m
+    JOIN `{CDR}.concept` c ON m.measurement_concept_id = c.concept_id
+    WHERE m.person_id IN UNNEST({pids})
+      AND c.vocabulary_id = 'LOINC'
     """
-    lab = _bq_to_df(lab_sql)
-    lab["token_name"] = "LAB:" + lab["source_value"].astype(str)
-
-    df = pd.concat([cond, drug, proc, lab], ignore_index=True)
-    df["d"] = pd.to_datetime(df["d"]).dt.normalize()
-    df["token_id"] = df["token_name"].map(VOCAB).fillna(-1).astype(int)
-    df = df[df["token_id"] >= 0]
-    df["token_type"] = df["token_id"].map(ID_TO_TYPE).fillna(0).astype(int)
-    df = df[df["token_type"] > 0]
-    return df[["person_id", "d", "token_id", "token_type"]]
+    df_cond = _bq_to_df(sql_cond)
+    df_drug = _bq_to_df(sql_drug)
+    df_proc = _bq_to_df(sql_proc)
+    df_lab = _bq_to_df(sql_lab)
+    ev = pd.concat([df_cond, df_drug, df_proc, df_lab], ignore_index=True)
+    ev["d"] = pd.to_datetime(ev["d"]).dt.normalize()
+    ev["token_name"] = ev["prefix"] + ":" + ev["code"].astype(str)
+    ev["token_id"] = ev["token_name"].map(VOCAB)
+    ev = ev.dropna(subset=["token_id"]).copy()
+    ev["token_id"] = ev["token_id"].astype(np.int32)
+    ev["token_type"] = ev["prefix"].map(PREFIX_TO_TYPE).astype(np.uint8)
+    return ev[["person_id", "d", "token_id", "token_type"]]
 
 
 # ---- Endpoint event fetching (v3-specific: multi-source)
