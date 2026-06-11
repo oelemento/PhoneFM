@@ -294,3 +294,56 @@ Inputs read:
 - `~/repos/PhoneFM/workbench/subgroup_definitions.json` (sha1 `c4ef26651c3da014acc93522bf7a7c1657d450a9`)
 
 Both scripts had the `torch.cuda.amp.autocast(...)` patched to `torch.amp.autocast(device_type=DEVICE, ...)` for CPU compatibility — backups at `.bak_pre_autocast_fix`.
+
+---
+
+## 14. Time-to-event aligned CV risk trajectories (2026-06-11)
+
+**Scripts:** `workbench/07_save_predictions.py` (persists per-window predictions) and `workbench/08_trajectory_analysis.py` (builds the figure). Committed to `oelemento/PhoneFM` @ `f9c180f` (07) and `4616f38` (08).
+**Artifacts on pod:** `~/workspace/phonefm-data/phonefm_v3/test_predictions.parquet` (1.15 MB, 61,677 rows), `trajectory_aligned.png`, `trajectory_examples.png`, `trajectory_summary.json`.
+
+### Question and the circularity trap
+
+Original framing: *"does predicted CV risk rise before an actual event?"* The naive version is **circular**: the event date is inferred from the cv30 label, and the cv30 head was trained on that label, so a rise toward the event is guaranteed by construction. Two rounds of adversarial code review reframed the claim to the only non-circular version: **does the cv30 head predict elevated risk for future-event cases vs event-free controls at x < −30 days (OUTSIDE its 30-day training horizon)?** Methodology hardening (all from review findings): first-event anchoring (handles recurrent AFib), controls anchored at a random masked window (not their endpoint), primary statistic = bootstrap CI on the per-bin case−control difference, [−30,0) shaded tautological, balanced-panel sensitivity overlay, n-annotated/min-n-greyed bins, lead time only from a contiguous difference-significant run.
+
+### Cohorts
+
+- **Cases:** 112 (≥1 cv30-positive masked window; event date estimable).
+- **Controls:** 1,278 (event-free at all horizons).
+- **Neither (cv180/cv365 event only, excluded):** 0.
+- **Recurrence:** 82/112 cases have cv30-positive windows spanning >30 days (recurrent). First-event anchoring keeps pre-first-event windows clean.
+- **Balanced panel** (cases present in all 6 bins): 62.
+
+### Results (cv30, bins centered −165 … −15 days before event)
+
+| Bin (days before event) | −165 | −135 | −105 | −75 | −45 | −15 |
+|---|---|---|---|---|---|---|
+| Cases — raw mean predicted risk | 0.412 | 0.432 | 0.456 | 0.495 | 0.500 | 0.498 |
+| Cases — **balanced panel** (n=62) | 0.412 | 0.405 | 0.421 | 0.417 | 0.422 | 0.422 |
+| Controls (n→1236) | 0.166 | 0.168 | 0.166 | 0.163 | 0.161 | 0.156 |
+| Difference (case − control) | 0.246 | 0.264 | 0.290 | 0.332 | 0.339 | 0.342 |
+| **Difference 95% CI low** | **0.161** | **0.182** | **0.208** | **0.252** | **0.264** | **0.271** |
+| case n / ctrl n | 62/1019 | 67/1068 | 72/1112 | 82/1150 | 91/1191 | 96/1236 |
+
+The cv_composite_30d AUROC recomputed from the saved predictions = 0.8856857330, an **exact match** (delta 0.00e+00) to the published test eval — the parquet is the same numerical run as the headline result.
+
+### Two findings (the second is why the review mattered)
+
+1. **Cases are significantly elevated above controls at every bin, including −165 days.** The difference-CI lower bound is >0 in all six bins (≈0.41 vs ≈0.16 predicted risk), so the model separates future-event cases from controls **from ~180 days before the event**, entirely in the non-tautological region (left of −30). This is genuine signal, not the model echoing its training label.
+
+2. **The apparent rise toward the event is a case-mix / survivorship artifact, NOT within-person escalation.** The raw case curve climbs 0.41 → 0.50, but the **balanced-panel curve is flat at ~0.41–0.42**. The rise comes from sicker cases entering the later bins (more windows near the event), not from any individual's risk climbing. The adversarial review flagged this confound; the balanced-panel sensitivity caught it.
+
+### Honest headline
+
+**This is a risk-STRATIFICATION result, not an acute early-warning ramp.** The model identifies people who will have a CV event months in advance, with stable elevated risk detectable ≥180 days out — rather than detecting a pre-event escalation. Claiming "risk rose before the event" (which the un-reviewed v1 figure would have implied) would have been wrong; the balanced panel shows no within-person rise. The stratification framing is the stronger and more defensible claim for a paper.
+
+### Process notes (lessons logged)
+
+- 07's first run completed the 5h forward pass then **crashed at the end** on a column-naming bug (`str.replace("cv_composite_", "cv")` left a trailing "d" → `cv30d` vs the expected `cv30`), losing the run. Neither review caught it. Fixed with an explicit name map.
+- The crash also exposed that the **no-checkpoint** shortcut (an adversarial-review finding I had waved off) turned one bug into a lost 5h run. 07 now **writes the parquet before** the reproduction check (which became non-fatal, renaming to `.SUSPECT` on mismatch), so a post-write bug can never again discard the forward pass.
+
+### Open follow-ups specific to this analysis
+
+- Sensitivity: restrict to single-event cases (drop the 82 recurrent) and confirm the stratification gap holds.
+- Consider a pseudo-event (calendar/window-count matched) control anchor as a further check on the random-window anchor.
+- The figures are aggregate/de-identified but require AoU export review before leaving the perimeter.
