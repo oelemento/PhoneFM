@@ -80,6 +80,15 @@ NUM_WORKERS = 0  # match 06_eval_v3_test.py
 # pick whichever lead time is most informative.
 HEADS_TO_SAVE = ("cv_composite_30d", "cv_composite_180d", "cv_composite_365d")
 
+# Explicit short column-name per head (cv30/cv180/cv365).  Do NOT derive this
+# with str.replace("cv_composite_", "cv") — that leaves the trailing "d"
+# ("cv30d") and silently desyncs from the reproduction guard and 08's PRIMARY.
+SHORT = {
+    "cv_composite_30d": "cv30",
+    "cv_composite_180d": "cv180",
+    "cv_composite_365d": "cv365",
+}
+
 # Published reference AUROC for cv_composite_30d on this test set, written by
 # 06_eval_v3_test.py to test_results.json on 2026-06-10.  The new script must
 # reproduce this within 1e-6 — if it doesn't, the predictions are wrong even
@@ -188,7 +197,7 @@ def main() -> None:
         "end_date": end_date_str,
     }
     for h in HEADS_TO_SAVE:
-        short = h.replace("cv_composite_", "cv")
+        short = SHORT[h]
         p = np.concatenate(preds[h]).astype(np.float32).reshape(-1)
         if len(p) != n_rows:
             raise RuntimeError(
@@ -199,27 +208,20 @@ def main() -> None:
         out_cols[f"{short}_label"] = meta_df[f"label_{h}"].to_numpy(dtype=np.int8)
         out_cols[f"{short}_mask"] = meta_df[f"mask_{h}"].to_numpy(dtype=np.int8)
 
-    # ---- AUROC reproduction guard.  Apply the same masking the eval script
-    #      used (mask == 1) and recompute cv_composite_30d AUROC.  Must match
-    #      the published 0.8857 within 1e-6 — anything else means the
-    #      predictions are wrong even though every structural guard passed.
-    cv30_pred = out_cols["cv30_pred"]
-    cv30_label = out_cols["cv30_label"]
-    cv30_mask = out_cols["cv30_mask"].astype(bool)
-    auroc = roc_auc_score(cv30_label[cv30_mask], cv30_pred[cv30_mask])
-    print(f"\nreproduction check: cv_composite_30d AUROC = {auroc:.10f}  "
-          f"(reference {REFERENCE_AUROC_CV30D:.10f}, delta {auroc - REFERENCE_AUROC_CV30D:+.2e})",
-          flush=True)
-    if abs(auroc - REFERENCE_AUROC_CV30D) > 1e-6:
-        raise RuntimeError(
-            f"AUROC reproduction FAILED: got {auroc}, expected ~{REFERENCE_AUROC_CV30D}.  "
-            f"Predictions diverge from 06_eval_v3_test.py — do not write output."
-        )
+    # ---- WRITE FIRST, verify after.  The forward pass is the expensive part
+    #      (~5h on CPU); a bug in any post-write check must NEVER discard it.
+    #      So persist the parquet immediately, then run the reproduction guard
+    #      as a non-fatal verification that flags (renames) a suspect file
+    #      rather than refusing to write.
+    out_df = pd.DataFrame(out_cols)
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pandas(out_df, preserve_index=False), OUT_PATH)
+    print(f"\nsaved predictions: {OUT_PATH}  rows={len(out_df)}  cols={list(out_df.columns)}", flush=True)
 
     # ---- Mean-pred sanity print (free check that predictions weren't, e.g.,
     #      all 0.5 or constant).  Should track the true positive rate.
     for h in HEADS_TO_SAVE:
-        short = h.replace("cv_composite_", "cv")
+        short = SHORT[h]
         m = out_cols[f"{short}_mask"].astype(bool)
         if m.sum() == 0:
             continue
@@ -227,10 +229,26 @@ def main() -> None:
         mean_pred = out_cols[f"{short}_pred"][m].mean()
         print(f"  {h:25s}: n_valid={int(m.sum()):>6d}  true_rate={true_rate:.4f}  mean_pred={mean_pred:.4f}", flush=True)
 
-    out_df = pd.DataFrame(out_cols)
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(out_df, preserve_index=False), OUT_PATH)
-    print(f"\nsaved predictions: {OUT_PATH}  rows={len(out_df)}  cols={list(out_df.columns)}", flush=True)
+    # ---- AUROC reproduction guard (non-fatal; output already on disk).  Apply
+    #      the same masking the eval script used (mask == 1) and recompute
+    #      cv_composite_30d AUROC.  Must match the published 0.8857 within 1e-6;
+    #      if not, the predictions diverge from 06_eval_v3_test.py and we rename
+    #      the file to .SUSPECT so downstream code won't silently trust it.
+    cv30 = SHORT["cv_composite_30d"]
+    cv30_pred = out_cols[f"{cv30}_pred"]
+    cv30_label = out_cols[f"{cv30}_label"]
+    cv30_mask = out_cols[f"{cv30}_mask"].astype(bool)
+    auroc = roc_auc_score(cv30_label[cv30_mask], cv30_pred[cv30_mask])
+    print(f"\nreproduction check: cv_composite_30d AUROC = {auroc:.10f}  "
+          f"(reference {REFERENCE_AUROC_CV30D:.10f}, delta {auroc - REFERENCE_AUROC_CV30D:+.2e})",
+          flush=True)
+    if abs(auroc - REFERENCE_AUROC_CV30D) > 1e-6:
+        suspect = OUT_PATH.with_suffix(".SUSPECT.parquet")
+        OUT_PATH.rename(suspect)
+        print(f"WARNING: AUROC reproduction FAILED — predictions diverge from "
+              f"06_eval_v3_test.py.  Output renamed to {suspect} (do not trust).", flush=True)
+    else:
+        print("reproduction check PASSED — predictions match the published eval.", flush=True)
 
 
 if __name__ == "__main__":
