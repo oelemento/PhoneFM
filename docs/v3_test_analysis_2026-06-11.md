@@ -402,4 +402,63 @@ The marginal-importance number is small precisely *because* EHR and wearables ar
 ### Open follow-ups
 
 - Run WEAR_PERM / WEAR_ZERO for the 180d and 365d horizons (only FULL/WEAR_DEMO/WEAR_ONLY were computed there) to get importance CIs at long horizons.
-- Per-stream ablation within wearables (steps vs heart-rate vs sleep) — directly answers "how useful are step counts," which is one of the credits-proposal milestones.
+- Per-stream ablation within wearables (steps vs heart-rate vs sleep) — directly answers "how useful are step counts," which is one of the credits-proposal milestones. **Done — see §16.**
+
+## 16. Per-stream wearable importance: steps vs heart-rate vs sleep (2026-06-12)
+
+**Question (Olivier, credits-proposal milestone):** Decompose §15's whole-wearable importance into the three physiological streams — how useful are step counts, specifically?
+
+**Script:** `workbench/10_ablation_streams.py` (commit d3d0a47; two review rounds, clean). Run on a temporary T4 pod (fp32), reverted to CPU after. **Permutation-only, leave-one-stream-out**, FULL context (EHR + confounders kept — same context as §15's whole-wearable importance, just decomposed). Dropped the confounded zeroing conditions per adversarial review (zero = the model's learned "missing-day" code, not a clean counterfactual).
+
+**Stream → wearable_feats columns** (code-grounded, `02_tokenizer_v3.py` encode_window_v3):
+steps `[0]`; heart-rate `[1,2,3,4]` (mean/resting/max/SDANN); sleep `[5,6,7,8,9,10]` (REM%/deep%/light%/duration/onset/7-day variability). IMPORTANCE_S = full − perm_S (permute only stream S's columns across windows, K derangements; everything else intact).
+
+**Run config note:** `N_PERM=5` and `BATCH_SIZE=128` (vs 09's K=10/batch=32) — reduced purely to fit GPU compute; the job is forward-pass-bound (41→21 passes/batch with K=5 roughly halved wall-time). Scientifically sound: the headline person-cluster CI uses `perm_0` (a single derangement, K-independent); `perm_mu`/`perm_sd` over 5 derangements remain stable (perm SD ~0.001–0.004). `perm_all` (whole-wearable) reproduced 09's +0.0275 exactly, confirming in-pipeline consistency.
+
+### Validation
+- FULL AUROC (GPU fp32) **0.885686** vs CPU ref 0.885686, |Δ|=1.85e-08 → hard reproduction assert passed before any deltas were written.
+- same-person neighbor fraction after shuffle = 0.0009.
+
+### Results — importance (full − perm), per horizon
+
+| Horizon | full | whole-wearable (all) | steps | heart-rate | sleep |
+|---|---|---|---|---|---|
+| cv_composite_30d | 0.8857 | **+0.0275** | **+0.0005** | +0.0147 | +0.0157 |
+| cv_composite_180d | 0.8673 | +0.0310 | +0.0011 | +0.0170 | +0.0210 |
+| cv_composite_365d | 0.8491 | +0.0350 | +0.0025 | +0.0193 | +0.0222 |
+
+### Headline (cv_composite_30d) — importance with person-cluster 95% CI (n_boot=2000)
+
+| Stream (cols) | importance | perm SD | 95% cluster CI | verdict |
+|---|---|---|---|---|
+| whole-wearable (11) | +0.0275 | 0.0012 | [+0.0130, +0.0450] | **significant** (= §15/09) |
+| heart-rate (4) | +0.0147 | 0.0035 | [+0.0060, +0.0322] | **significant** |
+| sleep (6) | +0.0157 | 0.0026 | [−0.0004, +0.0292] | borderline (touches 0) |
+| **steps (1)** | **+0.0005** | 0.0008 | [−0.0035, +0.0078] | **~zero, not significant** |
+
+**Pairwise importance differences** (paired person-cluster CI, shared resamples):
+- steps − heart-rate: [−0.0290, −0.0055] → **significant** (steps contributes less than HR)
+- steps − sleep: [−0.0299, +0.0066] → includes 0
+- heart-rate − sleep: [−0.0165, +0.0287] → includes 0
+
+### Findings
+
+1. **Step counts add essentially nothing unique to CV prediction once HR and sleep are present** (+0.0005, CI tightly around zero; significantly below HR). The wearable cardiovascular signal lives in **heart-rate (cardiac) and sleep architecture**.
+2. **The HR/sleep dominance grows with horizon** (HR 0.0147→0.0170→0.0193; sleep 0.0157→0.0210→0.0222), while steps stays ~0 throughout — consistent with §14/§15 (the months-ahead signal is physiological, not activity-volume).
+3. The whole-wearable importance (+0.0275) is recovered exactly, and the per-stream pieces are **not additive** (0.0005+0.0147+0.0157 ≈ 0.031 ≠ 0.0275) — expected under the leave-one-out estimator with cross-stream redundancy.
+
+### Honest caveats (load-bearing)
+- **Leave-one-out measures UNIQUE contribution.** Steps' ~0 means it is *redundant* with HR + sleep + EHR (steps co-varies with both), NOT that step counts carry no signal in isolation. An add-one-in (steps-alone) estimate would be needed to claim the latter.
+- **Column-count confound:** steps is 1 standardized column, HR 4, sleep 6; permuting more columns injects more perturbation, so cross-magnitude comparison is confounded. The qualitative ranking (steps lowest, steps < HR significant) is robust to this; the exact HR-vs-sleep ordering is not.
+- These numbers are in the FULL (EHR-present) context. A phone-deployable (EHR-masked) per-stream decomposition would likely show larger per-stream values.
+
+### Deployment takeaway
+For a phone-resident model, **the pedometer stream is the most expendable** of the three; **heart-rate and sleep are the load-bearing wearable inputs**. If sensor cost/battery/coverage forces a choice, drop steps before HR or sleep.
+
+### Pod / provenance
+- `ablation_streams.json` + `ablation_streams_rawpreds.npz` live on the pod's persistent disk inside the CT perimeter; numbers above are transcribed (aggregate/de-identified) and require AoU export review before any file leaves the perimeter.
+- T4 pod stopped and reverted to CPU-only (n1-standard-4) after the run.
+
+### Open follow-ups
+- Add-one-in (steps-alone, HR-alone, sleep-alone) via permute-the-complement, to separate "redundant" from "no signal" for steps.
+- Per-stream decomposition in the EHR-masked (phone-deployable) context.
