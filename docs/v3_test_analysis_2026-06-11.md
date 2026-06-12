@@ -522,3 +522,38 @@ Across redundancy (§16), add-one-in, and the phone-deployable EHR-masked decomp
 ### Pod / provenance
 - `ablation_streams_v2.json` + `ablation_streams_v2_rawpreds.npz` live on the pod's persistent disk inside the CT perimeter; numbers above are transcribed (aggregate/de-identified) and require AoU export review before any file leaves the perimeter.
 - T4 pod stopped and reverted to CPU-only (n1-standard-4) after the run.
+
+## 18. Wearable importance — synthesis across §15–§17 (paper-ready)
+
+Three test-set ablation runs (§15 whole-wearable; §16 per-stream leave-one-out, full context; §17 add-one-in + EHR-masked leave-one-out) triangulate one consistent story about what the wearable signal is and which streams carry it. All on the held-out test set; all reproduce the headline cv_composite_30d AUROC of **0.8857** exactly before any ablation. Numbers are aggregate/de-identified (CT perimeter; export review required before files leave).
+
+### The questions and the unified answer
+
+| Question | Estimator (run) | Result (cv30) | Reading |
+|---|---|---|---|
+| How important are wearables *as a whole*, on top of EHR? | full − perm(all wearables), full context (§15/§16) | **+0.0275** [+0.0130, +0.0450] | modest but significant — EHR is partly redundant with wearables |
+| Are wearables *sufficient* without EHR (phone scenario)? | wearables + demographics, EHR masked (§15) | AUROC **0.8500** (vs 0.8857 full) | yes — recovers ~96% of full performance with no hospital EHR |
+| How important are wearables to the *phone* model specifically? | demo − perm(all wearables), EHR-masked (§17) | **+0.0569** [+0.0305, +0.0856] | wearables are worth ~2× as much to the no-EHR model as to the EHR-rich one |
+| Which stream carries the signal — does steps matter? | per-stream leave-one-out + add-one-in (§16/§17) | see below | heart-rate & sleep; **not** steps |
+
+### Per-stream verdict (cv_composite_30d), triangulated
+
+| Stream (cols) | LOO, full ctx (§16) | add-one-in, full ctx (§17) | LOO, EHR-masked / phone (§17) | Verdict |
+|---|---|---|---|---|
+| **steps** (1) | +0.0005 [−0.0035,+0.0078] | +0.0034 [−0.0001,+0.0078] | −0.0001 [−0.0056,+0.0058] | **dispensable** — redundant *and* individually weak; ~0 in the phone model |
+| **heart-rate** (4) | +0.0147 [+0.0060,+0.0322] **sig** | +0.0136 [+0.0011,+0.0292] **sig** | +0.0308 [+0.0139,+0.0480] **sig** | **load-bearing** |
+| **sleep** (6) | +0.0157 [−0.0004,+0.0292] | +0.0105 [−0.0014,+0.0228] | +0.0275 [+0.0014,+0.0511] **sig** | **load-bearing** (clearly sig once EHR removed) |
+
+### The story (for the manuscript / proposal)
+
+1. **The wearable signal is real and increasingly carries the long horizon.** Whole-wearable importance grows with prediction window (30d→365d: +0.0275→+0.0350 full context), and the months-ahead risk stratification (§14) is physiological, not an acute ramp.
+2. **It lives in cardiac and sleep physiology, not activity volume.** Across three independent framings — unique contribution given everything (LOO), standalone contribution (add-one-in), and contribution to the phone-deployable model (EHR-masked) — **heart-rate and sleep are the load-bearing streams and step count is dispensable.** Steps adds ~nothing unique, ~nothing alone, and exactly zero to the phone model.
+3. **The phone-deployment case is strong and now well-supported.** Wearables + demographics (no EHR) reach 0.85 AUROC, and the wearable stream contributes +0.057 AUROC to that on-device model — so a phone that never touches a health system's records recovers most of the full model's discrimination, and that value is concentrated in two cheap, ubiquitous sensor streams (HR + sleep).
+
+### Caveats that travel with these numbers
+- Cross-stream magnitude comparisons are confounded by column count (steps=1, HR=4, sleep=6) and, for add-one-in, the count effect runs *opposite* to leave-one-out. The robust claims are directional/within-stream: steps ≈ 0 across all three framings; HR and sleep each significantly > 0 (HR in all contexts, sleep clearly so once EHR is removed). The exact HR-vs-sleep ordering is **not** claimed.
+- §17 used K=3 (compute/autostop constraint); CIs are honestly wider than a K=10 run would give, but the qualitative conclusions are stable.
+- "Steps dispensable" is a statement about *marginal predictive value in this model/cohort*, not a claim that physical activity is unrelated to CV risk — the information steps would carry is already captured by resting-HR/HRV and sleep architecture (physiologically sensible).
+
+### One-line takeaway
+**For a phone-resident cardiovascular foundation model, keep heart-rate and sleep, drop the pedometer; wearables alone (+demographics) recover ~96% of the EHR-rich model and contribute +0.057 AUROC to the on-device predictor.**
