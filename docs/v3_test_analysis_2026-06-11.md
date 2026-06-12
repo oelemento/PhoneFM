@@ -460,5 +460,65 @@ For a phone-resident model, **the pedometer stream is the most expendable** of t
 - T4 pod stopped and reverted to CPU-only (n1-standard-4) after the run.
 
 ### Open follow-ups
-- Add-one-in (steps-alone, HR-alone, sleep-alone) via permute-the-complement, to separate "redundant" from "no signal" for steps.
-- Per-stream decomposition in the EHR-masked (phone-deployable) context.
+- Add-one-in (steps-alone, HR-alone, sleep-alone) via permute-the-complement, to separate "redundant" from "no signal" for steps. **Done — see §17.**
+- Per-stream decomposition in the EHR-masked (phone-deployable) context. **Done — see §17.**
+
+## 17. Add-one-in + EHR-masked per-stream decomposition (2026-06-12)
+
+**Two follow-ups to §16, in one run** (`workbench/11_ablation_streams_v2.py`, commit 0dc45d6; two review rounds + a fix round, clean):
+- **Q1 ADD-ONE-IN (FULL context):** does steps' ~0 leave-one-out importance (§16) mean it is *redundant* or genuinely *uninformative*? For each stream S, permute the COMPLEMENT (the other two wearable streams) so only S stays correctly paired; `addin_S = AUROC(only_S) − AUROC(perm_all_wearables)`.
+- **Q2 LEAVE-ONE-OUT in the EHR-masked (phone-deployable) context:** which stream does the on-device model (EHR attention-masked, demographics kept = §15 wear_demo) lean on? `loo_S = AUROC(DEMO) − AUROC(DEMO + perm_S)`.
+
+Permutation-only; demographics kept in both contexts; only EHR attendance differs (FULL vs DEMO). The DEMO context masks EHR event tokens via `attn_mask & token_types<4` (token positions fixed by collate, so no positional leak — verified in review).
+
+**Run config note:** `N_PERM=3`, `BATCH_SIZE=128`, K-averaged person-cluster bootstrap (the CI averages AUROC over all K derangements *per resample* so it is centered on the K-mean point estimate — load-bearing because these effects are near-zero). Reduced from K=5/batch-256 to finish under the pod's **4-hour autostop** (the job is forward-pass-bound, ~16 s/batch even at batch 128). K=3 widens the CIs honestly; the qualitative conclusions are robust.
+
+### Validation
+- FULL AUROC 0.885686 vs CPU ref 0.885686 (|Δ|=1.85e-08) — hard assert passed.
+- DEMO AUROC 0.8500 vs §15 wear_demo 0.8500 (|Δ|=2.0e-05) — hard assert passed (Q2 baseline is faithful).
+- same-person neighbor fraction 0.0008.
+
+### Results — point estimates per horizon
+
+| Horizon | full | demo | addin_steps | addin_hr | addin_sleep | loo_steps | loo_hr | loo_sleep |
+|---|---|---|---|---|---|---|---|---|
+| cv_composite_30d | 0.8857 | 0.8500 | +0.0034 | +0.0136 | +0.0105 | −0.0001 | +0.0308 | +0.0275 |
+| cv_composite_180d | 0.8673 | 0.8466 | +0.0022 | +0.0130 | +0.0107 | +0.0003 | +0.0247 | +0.0257 |
+| cv_composite_365d | 0.8491 | 0.8279 | +0.0044 | +0.0160 | +0.0087 | +0.0009 | +0.0262 | +0.0280 |
+
+### Headline (cv_composite_30d) — with person-cluster 95% CI (n_boot=2000)
+
+**Q1 ADD-ONE-IN** (stream alone among wearables, over no-wearables):
+
+| Condition | value | 95% CI | verdict |
+|---|---|---|---|
+| whole-wearable | +0.0293 | [+0.0165, +0.0424] | **sig** |
+| **steps** | **+0.0034** | [−0.0001, +0.0078] | **CI grazes 0** |
+| heart-rate | +0.0136 | [+0.0011, +0.0292] | **sig** |
+| sleep | +0.0105 | [−0.0014, +0.0228] | CI incl 0 |
+
+**Q2 LEAVE-ONE-OUT (EHR-masked / phone-deployable):**
+
+| Condition | value | 95% CI | verdict |
+|---|---|---|---|
+| whole-wearable (demo) | **+0.0569** | [+0.0305, +0.0856] | **sig** |
+| **steps** (demo) | **−0.0001** | [−0.0056, +0.0058] | **~zero, n.s.** |
+| heart-rate (demo) | +0.0308 | [+0.0139, +0.0480] | **sig** |
+| sleep (demo) | +0.0275 | [+0.0014, +0.0511] | **sig** |
+
+### Findings
+
+1. **The steps question is settled: steps is redundant AND individually weak.** Even *alone among wearables* (Q1 add-one-in), steps adds only +0.0034 with a CI that grazes zero — not a strong standalone signal masked by redundancy. And in the phone-deployable model (Q2), removing steps costs **exactly nothing** (−0.0001, CI tight around 0). So the §16 near-zero leave-one-out was not just redundancy hiding a real signal — steps carries little CV-predictive information here, period.
+2. **Heart-rate and sleep are the load-bearing wearable streams, and the EHR-masked context proves it.** In the phone model both are *significantly* important (HR +0.0308 [+0.0139,+0.0480]; sleep +0.0275 [+0.0014,+0.0511]) — larger and cleaner than their FULL-context §16 values (HR +0.0147, sleep borderline +0.0157), exactly as predicted: without EHR to absorb the cross-stream redundancy, each stream's unique contribution grows and both cross significance.
+3. **Wearables matter a lot to the phone-deployable model:** whole-wearable importance in the DEMO context is **+0.0569** [+0.0305, +0.0856] — i.e. on top of demographics, the wearable signal contributes ~0.057 AUROC to the no-EHR model. (Compare the FULL-context whole-wearable +0.0275 from §16/09 — wearables are roughly twice as valuable to the phone model as to the EHR-rich model.)
+
+### Caveats (carried forward)
+- **Add-one-in column-count runs OPPOSITE to leave-one-out:** only_steps permutes 10 cols / only_sleep permutes 5, so addin_steps keeps only 1 column correctly paired vs addin_sleep's 6. Q1 is therefore reported WITHIN-stream only (is addin_steps itself >0?); do NOT rank addin across streams. The Q2 leave-one-out ranking has the same column-count confound as §16 (steps=1/hr=4/sleep=6), so the exact HR-vs-sleep ordering is not claimed — only that HR and sleep are both clearly >0 and steps is ~0.
+- FULL and DEMO perm_all share a per-batch derangement; the two whole-wear importances are reported with their own CIs, NOT a paired (full−demo) CI.
+
+### Deployment takeaway (final)
+Across redundancy (§16), add-one-in, and the phone-deployable EHR-masked decomposition, the conclusion is consistent and now well-supported: **for a phone-resident CV model, keep heart-rate and sleep; the pedometer/step stream is dispensable.** Wearables collectively are worth ~0.057 AUROC to the on-device model, and that value lives in cardiac and sleep physiology, not activity volume.
+
+### Pod / provenance
+- `ablation_streams_v2.json` + `ablation_streams_v2_rawpreds.npz` live on the pod's persistent disk inside the CT perimeter; numbers above are transcribed (aggregate/de-identified) and require AoU export review before any file leaves the perimeter.
+- T4 pod stopped and reverted to CPU-only (n1-standard-4) after the run.
