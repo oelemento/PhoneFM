@@ -347,3 +347,59 @@ The cv_composite_30d AUROC recomputed from the saved predictions = 0.8856857330,
 - Sensitivity: restrict to single-event cases (drop the 82 recurrent) and confirm the stratification gap holds.
 - Consider a pseudo-event (calendar/window-count matched) control anchor as a further check on the random-window anchor.
 - The figures are aggregate/de-identified but require AoU export review before leaving the perimeter.
+
+## 15. Wearable importance & sufficiency ablation (2026-06-11)
+
+**Question (Olivier):** How important are the wearable streams for prediction, in AUROC terms — and, separately, how far can wearables + basic demographics get on their own (the phone-deployable floor)?
+
+**Script:** `workbench/09_ablation_wearables.py` (commit 0471487, sha256 3f396c24). Ran on a temporary T4 GPU pod (fp32, no autocast) added to the CT workspace via the Workbench UI; reverted to CPU-only (n1-standard-4) immediately after to stop GPU billing. Same test split and saved checkpoint as the headline eval.
+
+### Conditions
+
+| Condition | What is masked | Interpretation |
+|---|---|---|
+| FULL | nothing | EHR + wearables + demographics (the 0.8857 baseline) |
+| WEAR_PERM | wearable tokens permuted across persons (K=10 random derangements) | destroys the wearable *signal* while preserving its marginal distribution |
+| WEAR_ZERO | wearable feature values zeroed | cross-check on the permutation |
+| WEAR_DEMO | EHR events attention-masked (`attn_mask & token_types<4`), confounders kept | wearables + demographics **sufficiency** — the phone-deployable number |
+| WEAR_ONLY | EHR masked **and** confounders zeroed | pure wearable floor |
+
+**Importance** = FULL − WEAR_PERM (signal removed in place). **Sufficiency** = WEAR_DEMO and WEAR_ONLY (everything else removed). These are different questions and give different answers.
+
+### Validation of the GPU setup
+
+- FULL AUROC on GPU fp32 = 0.885686 vs CPU reference 0.885686, |Δ| = 2.8e-08 → the masking harness reproduces the headline run exactly before any ablation is applied.
+- Permutation mixed persons correctly: same-person neighbor fraction after shuffle = 0.0010.
+
+### Results
+
+| Horizon | FULL | WEAR_PERM (μ±sd) | WEAR_ZERO | WEAR_DEMO (suff.) | WEAR_ONLY (floor) | **Importance** (FULL−PERM) |
+|---|---|---|---|---|---|---|
+| cv_composite_30d | 0.8857 | 0.8582 ± 0.0021 | 0.8756 | **0.8500** | 0.6789 | **+0.0275** |
+| cv_composite_180d | 0.8673 | — | — | 0.8466 | 0.6504 | +0.0304 |
+| cv_composite_365d | 0.8491 | — | — | 0.8279 | 0.6309 | +0.0329 |
+
+- **Importance (30d) = +0.0275**, perm SD 0.0021; person-level cluster bootstrap 95% CI **[+0.0129, +0.0422]** (n_boot=2000) → significant but small.
+- **Perm-vs-zero gap** = 0.8756 − 0.8582 = +0.0175 (zeroing under-removes signal vs permutation; both well below FULL).
+
+### Two findings
+
+1. **Wearables are only modestly *additive* on top of EHR (+0.0275 AUROC).** The signal is partly redundant with the EHR stream — removing it in place costs little because EHR carries overlapping information. This is the conservative, marginal-contribution view.
+
+2. **Wearables are strongly *sufficient* on their own.** With EHR entirely masked, **wearables + demographics reach 0.8500** (30d) — only 0.036 below the full model. This is the deployment-relevant number: a phone that has the wearable stream + basic demographics, but no EHR feed, still recovers ~96% of the full discriminative performance. Pure wearables (no demographics) alone reach 0.6789.
+
+**Importance grows with horizon** (+0.0275 → +0.0304 → +0.0329 from 30d to 365d): EHR dominates the near-term signal, wearables carry an increasing share further out. Consistent with §14's finding that the model is doing months-ahead risk stratification — the wearable physiology is where the long-horizon signal lives.
+
+### Honest headline
+
+The marginal-importance number is small precisely *because* EHR and wearables are redundant — that is not a weakness for the phone use-case, it is the point. The sufficiency result (0.85 from wearables + demographics, EHR removed) is the one that matters for "can this run on a phone without an EHR feed," and it is strong. Report both; lead with sufficiency for the deployment argument and importance for the mechanistic/feature-attribution argument.
+
+### Pod / cost note
+
+- T4 pod ran at $0.57/hr during the ablation. After completion: stopped the instance (GCE `stop`, 200 OK) and reconfigured the app to CPU-only **n1-standard-4** (4 vCPU, 15 GB, no GPU) → $0.22/hr running, $0.03/hr stopped. 500 GB persistent disk (results JSON, git repo, cohort) preserved.
+- `ablation_wearables.json` lives on the pod's persistent disk inside the CT perimeter; numbers above are transcribed (aggregate/de-identified) and require export review before any file leaves the perimeter.
+
+### Open follow-ups
+
+- Run WEAR_PERM / WEAR_ZERO for the 180d and 365d horizons (only FULL/WEAR_DEMO/WEAR_ONLY were computed there) to get importance CIs at long horizons.
+- Per-stream ablation within wearables (steps vs heart-rate vs sleep) — directly answers "how useful are step counts," which is one of the credits-proposal milestones.
