@@ -557,3 +557,48 @@ Three test-set ablation runs (§15 whole-wearable; §16 per-stream leave-one-out
 
 ### One-line takeaway
 **For a phone-resident cardiovascular foundation model, keep heart-rate and sleep, drop the pedometer; wearables alone (+demographics) recover ~96% of the EHR-rich model and contribute +0.057 AUROC to the on-device predictor.**
+
+## 19. Non-FM baseline sweep — does the 13.3M FM beat simple classifiers? (2026-06-13)
+
+**Motivation.** A reviewer's first question about any foundation model is "does it actually beat a simple classifier on the same inputs?" To answer it on the held-out test set, we built standard non-FM baselines that need no FM forward pass and ran them through the *same* evaluation pipeline (same person-level test split, same person-cluster bootstrap, `BOOT_SEED=20260609`, `n_boot=1000`, ≥5-positive-and-negative per-resample guard) as the FM eval (`06_eval_v3_test.py`). Script: `workbench/12_baselines.py`.
+
+**Design (one pipeline, identical to the FM eval where it matters).**
+- **3 feature representations**, each + the 9 demographic confounders: **HAND** = wearable summary stats (mean/std/min/max/p25/p50/p75 over present days + coverage), **TOK** = multi-hot bag-of-tokens over the content vocabulary, **RAW7** = last-7-days raw wearable signals flattened.
+- **3 models**: `LogisticRegression` (L2, class-balanced), `HistGradientBoostingClassifier` (the XGBoost-equivalent), `MLPClassifier` (128-64).
+- **Config selection without test-set peeking**: for each head, fit every (rep, model) on train, pick the single config with the best **validation** AUROC, and report *that* config's **test** AUROC + CI. The full 9-cell grid is also saved.
+- Negative-control heads are reported but their FM−baseline deltas are not interpreted.
+
+### Headline result — FM vs best val-selected baseline (test AUROC)
+
+| Endpoint | FM | best baseline (config) | **FM − baseline** |
+|---|---|---|---|
+| t2d_180d | 0.657 | 0.588 (hand/histgb) | **+0.069** |
+| t2d_365d | 0.643 | 0.591 (hand/histgb) | **+0.052** |
+| cv_composite_30d | **0.886** | **0.873** (tok/logreg) | **+0.013** |
+| cv_composite_180d | 0.867 | 0.855 (tok/logreg) | **+0.012** |
+| cv_composite_365d | 0.849 | 0.822 (tok/histgb) | **+0.027** |
+| dep_180d | 0.598 | 0.600 (hand/logreg) | **−0.002** |
+| dep_365d | 0.578 | 0.592 (hand/logreg) | **−0.014** |
+| skin_neoplasm_365d *(neg ctrl)* | 0.561 | 0.649 (tok/logreg) | −0.088 |
+| refractive_errors_365d *(neg ctrl)* | 0.520 | 0.616 (tok/logreg) | −0.096 |
+| dental_caries_365d *(neg ctrl)* | 0.577 | 0.530 (hand/logreg) | +0.047 |
+
+Mortality heads (30/180/365d) were skipped by both pipelines: zero positive deaths among valid-masked test windows in this young wearable cohort.
+
+### The story
+
+1. **The FM's advantage is endpoint-dependent, not uniform.** It beats the best simple non-FM baseline **clearly for type-2 diabetes (+0.05 to +0.07)**, **modestly but consistently for the cardiovascular composite (+0.01 to +0.03 across horizons)**, and **not at all for depression (≈0 / slightly negative)**. The honest framing for the paper is per-endpoint, not a single "FM beats baselines" claim.
+2. **For the headline CV endpoint, a bag-of-tokens logistic regression is a strong baseline.** cv_composite_30d: FM 0.886 vs a converged L2-LR on multi-hot EHR/wearable tokens at **0.873**. The FM's edge is real and survives across horizons but is ~1–3 points, not large. The CV signal is substantially linear-in-token-presence.
+3. **Negative controls behave sensibly.** The FM sits near chance on all three (0.52–0.58) and *below* the baseline on skin-neoplasm/refractive-errors — because those baseline AUROCs (0.62–0.65) are driven by the demographic confounders (age predicts skin neoplasm), which the token-FM relies on less. This is reassuring: the FM is not just re-encoding age.
+
+### Methods note that materially changed a number (do not skip)
+
+The first run used `LogisticRegression(solver="saga", max_iter=3000)`. On 618k training rows the saga solver **never converged** (it ran the full 3000 single-threaded passes and hit the iteration cap), which **understated the bag-of-tokens LR baseline**: cv_composite_30d came out at 0.857 instead of the converged 0.873. That truncation had inflated the FM's apparent CV lead to +0.028. Switching to `solver="lbfgs"` (a quasi-Newton method that minimizes the *identical* L2-regularized objective and converges in ~100 steps) gives the correct, converged baseline of **0.873** and the honest gap of **+0.013**. The lbfgs numbers reproduced the saga numbers exactly for every head whose selected config was a tree/MLP (solver-independent), confirming the swap is faithful. We also restricted the LR sparse matrix to the 154 token columns with non-zero train document-frequency (of the 6007-token vocab); columns that are identically zero in training get a zero LR coefficient and cannot affect predictions, so this is exact, not an approximation, and it removed ~5,850 dead columns.
+
+### Caveats
+- CIs were computed only for the four primary-best-metric heads (cv_composite_30d, mortality_365d, t2d_365d, dep_365d); cv_composite_30d baseline 95% CI [0.831, 0.911] overlaps the FM CI [0.850, 0.916], so the +0.013 CV gap is **not** individually significant at this n — the consistent sign across all three CV horizons is the stronger evidence.
+- The MLP never won a val-selection on any head (every pick was HistGB or LogReg) and did not converge at `max_iter=150`; it is a faithful-but-weak member of the grid, retained because LR + GBM + MLP is the standard non-FM trio.
+- Run logistics: the sweep is MLP/compute-bound on the perimeter VM (numpy's bundled OpenBLAS is capped at `MAX_THREADS=2`, so fits use ≤2 of 16 cores); features are cached to `baselines_features_{split}.npz` so re-runs skip extraction. A process-parallel version (independent fits across cores, identical results) is the path to a ~30-min run if needed.
+
+### One-line takeaway
+**The 13.3M phone FM beats simple non-FM baselines decisively for diabetes, modestly for cardiovascular risk, and not for depression; for the headline CV endpoint a converged bag-of-tokens logistic regression reaches 0.873 vs the FM's 0.886 (+0.013), so the FM's CV advantage over a strong simple baseline is real but small.**

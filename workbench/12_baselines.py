@@ -193,8 +193,8 @@ def cluster_ci(y: np.ndarray, s: np.ndarray, pid: np.ndarray) -> dict:
 
 def new_model(name: str):
     if name == "logreg":
-        return LogisticRegression(max_iter=3000, C=1.0, class_weight="balanced",
-                                  solver="saga", n_jobs=-1)
+        return LogisticRegression(max_iter=1000, C=1.0, class_weight="balanced",
+                                  solver="lbfgs")
     if name == "histgb":
         return HistGradientBoostingClassifier(max_iter=300, max_depth=4, learning_rate=0.08,
                                               l2_regularization=1.0, random_state=SEED)
@@ -220,7 +220,7 @@ def main() -> None:
     topk = np.argsort(dfreq)[::-1][:TOPK_TOKENS]
     topk = np.sort(topk[dfreq[topk] > 0])
     print(f"bag-of-tokens: dense top-{len(topk)} of {VOCAB_SIZE} (min train doc-freq "
-          f"{dfreq[topk].min():.0f}); LogReg uses full sparse vocab", flush=True)
+          f"{dfreq[topk].min():.0f}); LogReg uses only train-nonzero token cols (mathematically equivalent)", flush=True)
 
     sc_hand = StandardScaler().fit(np.hstack([tr["X_hand"], tr["C"]]))
     sc_raw7 = StandardScaler().fit(np.hstack([tr["X_raw7"], tr["C"]]))
@@ -232,7 +232,7 @@ def main() -> None:
             "hand": sc_hand.transform(np.hstack([d["X_hand"], d["C"]])).astype(np.float32),
             "raw7": sc_raw7.transform(np.hstack([d["X_raw7"], d["C"]])).astype(np.float32),
             "tok_dense": np.hstack([d["tok"][:, topk].toarray(), conf_s]).astype(np.float32),
-            "tok_sparse": sparse.hstack([d["tok"][:, FIRST_CONTENT_ID:],
+            "tok_sparse": sparse.hstack([d["tok"][:, topk],
                                          sparse.csr_matrix(conf_s)]).tocsr(),
         }
     Mtr, Mva, Mte = build(tr), build(va), build(te)
