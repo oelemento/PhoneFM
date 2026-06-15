@@ -176,9 +176,40 @@ ole2001@med.cornell.edu
 
 ## 5. Outstanding actions
 
-1. Olivier signs into Zendesk (top-right "Sign-in using @researchallofus.org account") and clicks Submit on the support ticket.
-2. AoU support reviews (5–7 business days standard; AI/ML pathway timeline unconfirmed — asked in heads-up email).
-3. On approval: provision destination bucket (probably `gs://wcm-eipm-phonefm-export/` or per AoU guidance), `gsutil cp ~/export/phonefm_v3/*` from pod to destination during the 2-day Mon-Tue relaxation window.
+1. ~~Olivier signs into Zendesk and clicks Submit on the support ticket.~~ ✓ done
+2. AoU support reviews the LDE submission (5–7 business days standard; AI/ML pathway timeline unconfirmed).
+3. **Provision WCM GCS bucket** — AoU confirmed they do NOT provide a release endpoint (see §7 below). Stand up `gs://wcm-eipm-phonefm-export/` (or equivalent) in advance so the approved 2-day egress window isn't burned on bucket setup.
+4. On approval: `gsutil cp ~/export/phonefm_v3/*` from pod to the WCM destination during the 2-day Mon-Tue relaxation window.
+5. Reply to AoU support ticket #58783 (Susana Martinez) confirming the LDE form is now submitted (her reply pre-dated our submission), and to keep the thread alive.
+
+---
+
+## 7. AoU support response to heads-up email (received 2026-06-15 12:52 CDT / 13:52 EDT)
+
+**Zendesk ticket:** #58783 (this is the ticket created by the heads-up email, NOT the LDE submission)
+**From:** Susana Martinez (AoU Researcher Workbench Support Team)
+**Reply timestamp:** Jun 15, 2026, 12:52 CDT
+
+Verbatim relevant content:
+
+> Thank you for reaching out with your detailed inquiry regarding the Large Download Exemption request for your AI/ML model weights.
+>
+> For such requests, please submit the Large Download Exemption Request form as described in our policy (here). The form requires a summary of the data and confirmation that no participant-level data is being downloaded.
+>
+> Regarding storage, the AoU program does not provide a release endpoint; provisioning your own GCS bucket (e.g., at Weill Cornell Medicine) is advisable.
+>
+> For assistance, the VUMC IDASC team can help with large downloads, involving contracting and fees.
+> More details: Large Download Requests.
+
+**Key takeaways:**
+- ✓ Confirmed pathway: standard Large Download Exemption form is correct for AI/ML model-weight egress (no special process).
+- ✓ Answered Q2: **no AoU release endpoint** — we must provision a WCM GCS bucket. New action item §5.3 above.
+- ✓ Reaffirmed IDASC option (we already selected Yes in the REDCap form).
+- ✗ Did NOT answer Q3 (AI/ML turnaround time) — assume standard 5–7 business days unless told otherwise.
+
+Note: Susana's reply was sent at 12:52 CDT, which was BEFORE Olivier's REDCap + Zendesk LDE submissions earlier in the afternoon. She didn't yet know they'd been filed. A short follow-up reply on the thread will keep the loop closed.
+
+**LDE Zendesk ticket number (set by Zendesk on submission):** *(TBD — paste here from the confirmation email/page Olivier received)*
 
 ---
 
