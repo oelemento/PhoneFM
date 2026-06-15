@@ -166,10 +166,12 @@ def collect_losses(
 
     pw_primary = torch.tensor(pos_weights[PRIMARY_HEAD], device=DEVICE, dtype=torch.float32)
 
-    autocast_ctx: contextlib.AbstractContextManager = (
-        torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)  # type: ignore[attr-defined]
-        if DEVICE == "cuda" else contextlib.nullcontext()
-    )
+    if DEVICE == "cuda" and torch.cuda.is_bf16_supported():
+        autocast_ctx: contextlib.AbstractContextManager = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)  # type: ignore[attr-defined]
+        )
+    else:
+        autocast_ctx = contextlib.nullcontext()
 
     for batch in loader:
         input_ids = batch["input_ids"].to(DEVICE)
@@ -403,7 +405,7 @@ def main():
                 "test": "primary — never seen during training or checkpoint selection",
                 "val_DIAGNOSTIC": "secondary — best.pt was selected on val via early-stopping; train-vs-val gap conflates memorization with checkpoint-selection bias and is reported as diagnostic only, NOT as a verdict-eligible signal",
             },
-            "loss_replication": "bf16 autocast on forward pass matching 05_train_v3.py; logits up-cast to fp32 before BCE",
+            "loss_replication": "bf16 autocast on forward pass matching 05_train_v3.py when the GPU supports it (Ampere+); falls back to fp32 (no autocast) on bf16-unsupported GPUs (Turing/T4). fp32 is a more conservative choice for audit-time loss comparison than bf16; documented here for transparency. Logits always up-cast to fp32 before BCE.",
             "reproducibility": f"per-arm seeds derived from base SEED={SEED}: test={SEED+10}, val={SEED+20}, train={SEED+30}; loader uses num_workers=0, shuffle=False, deterministic sampling plan via Subset",
         },
         "arms": arm_summaries,
