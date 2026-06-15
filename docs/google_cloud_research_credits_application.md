@@ -23,25 +23,19 @@ Form: https://edu.google.com/intl/ALL_us/programs/credits/research/
 
 ## Project information
 
-**Project name:** PhoneFM — On-Device Cardiovascular Foundation Model from Wearable + EHR Data
+**Project name:** On-Device Cardiovascular Foundation Model from Wearable + EHR Data
 
 **Project start date:** 2026-06-23 (or whatever works)
 
 ### Proposal (~245 words; 250 word maximum)
 
-Cardiovascular disease (CVD) is the leading cause of death globally, yet existing risk tools (ASCVD, CHA₂DS₂-VASc) require clinic visits and a small set of static inputs. Smartphones already collect continuous Fitbit/Apple Health signals from hundreds of millions of users, but no validated, on-device foundation model translates these into actionable CVD risk.
+Cardiovascular disease is the leading global cause of death, yet current risk tools such as ASCVD require clinic visits and a handful of static inputs. Smartphones already collect continuous wearable signals, but no validated on-device foundation model converts these into actionable cardiovascular risk.
 
-PhoneFM is a 13M-parameter transformer pretrained via self-supervised masked daily-vector reconstruction on 920K wearable+EHR windows from the All of Us cohort (12,500 participants). Our v3 model achieves AUROC=0.88 on 30-day cardiovascular composite (AFib+MI+HF) prediction, with three pre-registered negative-control endpoints (skin neoplasm, refractive errors, dental caries) tracking to ≈0.5 — confirming the model captures real wearable physiology rather than healthcare-utilization confounders.
+Our preliminary foundation model is a 13-million-parameter transformer pretrained on 920K wearable + EHR windows from the All of Us cohort. It achieves AUROC = 0.88 on a 30-day cardiovascular composite (AFib + MI + HF), while pre-registered negative-control endpoints (skin neoplasm, refractive errors, dental caries) track near 0.5, consistent with capturing real wearable physiology rather than healthcare-utilization confounders.
 
-**GCP tools:** Vertex AI Training (A100/H100) for backbone scale-up to 50M parameters; BigQuery for cohort extraction across All of Us and UK Biobank; Cloud Storage for tokenized data and model checkpoints; Vertex AI Endpoints for inference latency benchmarking and federated-learning prototypes; Cloud Healthcare API for FHIR-mediated EHR integration.
+The proposed work pursues four research questions. (M1–3) Which architectures, tokenizations, and input modalities (steps, heart rate, sleep, polygenic risk scores, labs, social determinants) most improve over clinical risk scores and tree-based baselines, with per-modality ablations quantifying the contribution of each signal? (M4–6) Does the model transfer to UK Biobank, and where do demographic performance gaps emerge across pre-registered subgroups (race, age, sex, SES)? (M7–9) Can the model run on consumer smartphones (iPhone Core ML/HealthKit; Android TensorFlow Lite/Health Connect) with acceptable latency, ingesting locally-stored wearable signals and producing on-device cardiovascular predictions? (M10–12) Can federated continuous learning across simulated sites match centralized performance? Results will be reported in a manuscript.
 
-**12-month milestones:**
-- M1-3: Scale to 50M-parameter backbone; integrate published polygenic risk scores
-- M4-6: UK Biobank external validation; iPhone Core ML deployment via TestFlight
-- M7-9: Federated continuous-learning prototype across institutional partners
-- M10-12: Manuscript (Nature Medicine target); NIH R01 submission
-
-**Future support:** Sustained Vertex AI infrastructure for federated training across our institutional collaborators (BCCA, Sage Bionetworks) and a HIPAA-aligned model registry for clinical deployment.
+Google Cloud underpins every question, with Vertex AI Training (A100/H100) for architecture sweeps and ablations, BigQuery for cohort extraction from All of Us and UK Biobank, Cloud Storage for data and checkpoints, and Cloud Healthcare API for FHIR integration.
 
 ### Field of research
 
@@ -53,7 +47,7 @@ Health and Life Sciences (medical AI / digital health)
 
 ### Google Scholar link
 
-https://scholar.google.com/citations?user=AYa6tNcAAAAJ
+https://scholar.google.com/citations?user=IP7KtcQAAAAJ
 
 ### How do you intend to apply awarded cloud credits?
 
@@ -61,7 +55,7 @@ https://scholar.google.com/citations?user=AYa6tNcAAAAJ
 
 ### Does your research project have an external funding source?
 
-**Yes.** Project is supported by Weill Cornell Medicine / Englander Institute for Precision Medicine internal funds, and PI Olivier Elemento holds active NIH grants. An NIH R01 application leveraging PhoneFM as preliminary data is planned within the credit period.
+**Yes.** This project is currently supported by Weill Cornell Medicine / Englander Institute for Precision Medicine internal research funds. PI Olivier Elemento holds multiple active NIH grants across the broader translational AI program at EIPM. PhoneFM is the preliminary-data engine for a planned NIH R01 submission within the requested credit period — the credit-supported work directly enables that grant application.
 
 ### Have you used cloud infrastructure for your research before?
 
@@ -87,17 +81,17 @@ Submit estimate via [GCP Pricing Calculator](https://cloud.google.com/products/c
 | Cloud Healthcare API | light usage | est. | $200 |
 | **Total annual estimate** | | | **~$6,100** |
 
-**Recommended ask:** **$10,000** (gives ~50% headroom for unanticipated scale-ups: 50M-parameter backbone, federated multi-institution training, longer training sweeps for ablations).
+**Program cap (verified 2026-06-10 via Cloud for Education Help):** Faculty / postdoc / non-profit-lab researcher awards are worth **up to $5,000 USD** (PhD students up to $1,000). One award per faculty member; additional credits possible via the referral program (refer 2 qualified applicants → eligible for new grant).
+
+**Recommended ask:** **$5,000** (the program cap). The calculator estimate above (~$6,100/yr) slightly exceeds this; the request fully consumes the credit on the planned A100 backbone + cohort-extraction work, with any overage absorbed by Englander Institute internal funds. For scale-ups beyond the credit (50M-parameter backbone, federated multi-institution training, longer ablation sweeps), pursue the referral pathway and/or transition to NIH R01 funding.
 
 ### Google Cloud Billing Account ID
 
-*(Create a new Cloud Billing Account at https://console.cloud.google.com/billing if needed — separate from the AoU-provided one which is read-only.)*
-
-Format: XXXXXX-XXXXXX-XXXXXX
+**`01043B-772AC9-33DDE1`** — currently funding the active PhoneFM CT cohort (Copy) workspace `wb-shrewd-lime-9770` on Verily Workbench.
 
 ### After your credit expires, how do you intend to continue funding your project?
 
-Project funding will transition to (a) active NIH R01 grants held by PI Elemento, (b) Englander Institute for Precision Medicine internal infrastructure budget, and (c) Weill Cornell Medicine departmental research support. PhoneFM is also a component of a broader translational initiative ("LLM-in-a-Box") co-developed with industry partners; revenue from successful TestFlight deployment and any subsequent clinical-decision-support licensing would sustain ongoing cloud infrastructure costs.
+Active NIH R01 grants held by PI Elemento, a planned R01 for which this work generates preliminary data, Englander Institute for Precision Medicine infrastructure budget, and Weill Cornell Medicine departmental research support.
 
 ---
 
